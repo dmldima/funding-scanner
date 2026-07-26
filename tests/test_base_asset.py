@@ -85,6 +85,41 @@ class TestOkxSettlementMarkers(unittest.TestCase):
                 self.assertEqual(base_asset(raw), want)
 
 
+class TestQuoteVariants(unittest.TestCase):
+    """USDT and USDC contracts of one asset must reduce to the same base, or the
+    two legs never pair up in a cross-venue comparison. Each venue spells them
+    differently, and several were being skipped entirely before these were
+    covered."""
+
+    def test_usdc_shapes_match_usdt(self):
+        for usdt, usdc in [
+            ("BTCUSDT", "BTCUSDC"),          # binance / bybit
+            ("BTC_USDT", "BTC_USDC"),        # mexc, gate
+            ("BTC-USDT", "BTC-USDC"),        # bingx, kucoin spot
+            ("BTCUSDTM", "BTCUSDCM"),        # kucoin perp
+        ]:
+            with self.subTest(pair=(usdt, usdc)):
+                self.assertEqual(base_asset(usdt), base_asset(usdc))
+                self.assertEqual(base_asset(usdc), "BTC")
+
+    def test_bitget_usdc_product_type(self):
+        """USDC-FUTURES drops the quote entirely: BTCPERP, not BTCUSDC."""
+        for raw, want in [("BTCPERP", "BTC"), ("ETHPERP", "ETH"),
+                          ("PEPEPERP", "PEPE"), ("DOGEPERP", "DOGE")]:
+            with self.subTest(raw=raw):
+                self.assertEqual(base_asset(raw), want)
+
+    def test_whitebit_perp_suffix(self):
+        for raw, want in [("BTC_PERP", "BTC"), ("0G_PERP", "0G"),
+                          ("1INCH_PERP", "1INCH"), ("XAU_PERP", "XAU")]:
+            with self.subTest(raw=raw):
+                self.assertEqual(base_asset(raw), want)
+
+    def test_stablecoin_quoted_in_another_stablecoin(self):
+        """USDCUSDT is the USDC perp quoted in USDT — base USDC, not empty."""
+        self.assertEqual(base_asset("USDCUSDT"), "USDC")
+
+
 class TestMultipliers(unittest.TestCase):
     """1000PEPE and PEPE are the same asset; their funding rates are directly
     comparable, so the multiplier must go or cross-venue pairing breaks."""

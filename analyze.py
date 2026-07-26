@@ -43,6 +43,7 @@ TAKER_FEE_PCT = {
     "binance": 0.050, "bybit": 0.055, "okx": 0.050, "bitget": 0.060,
     "gate": 0.050, "mexc": 0.020, "kucoin": 0.060, "htx": 0.040,
     "bitmex": 0.075, "coinex": 0.050, "bingx": 0.050, "deribit": 0.050,
+    "whitebit": 0.055,   # from /api/v4/public/markets, uniform across 303 perps
     "hyperliquid": 0.045, "dydx": 0.050, "paradex": 0.030, "backpack": 0.050,
 }
 DEFAULT_FEE = 0.055

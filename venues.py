@@ -456,14 +456,41 @@ def gate_future() -> list[Observation]:
 # --------------------------------------------------------------------------- #
 
 def bitget_perp() -> list[Observation]:
-    rows = _get("https://api.bitget.com/api/v2/mix/market/tickers",
-                {"productType": "USDT-FUTURES"})["data"]
-    return [Observation("bitget", PERP, r["symbol"], base_asset(r["symbol"]),
-                        mark=_f(r.get("markPrice")), index=_f(r.get("indexPrice")),
-                        funding_rate=_f(r.get("fundingRate")), funding_interval_h=8.0,
-                        turnover_musd=_f(r.get("usdtVolume")) / 1e6,
-                        oi_musd=_f(r.get("holdingAmount")) * _f(r.get("markPrice")) / 1e6)
-            for r in rows]
+    """Both linear product types, each with its interval read per instrument.
+
+    Two separate corrections. Bitget is NOT an 8h venue — 373 of 721 USDT
+    symbols and 17 of 49 USDC ones settle every 4h — and the tickers response
+    carries no interval at all, so it comes from the contracts endpoint.
+
+    And USDC-FUTURES is a distinct productType that was never fetched: 49
+    contracts, including USDC-margined BTC and ETH, absent from the archive
+    entirely. COIN-FUTURES stays out on purpose: it is inverse, so its
+    turnover is denominated in the coin rather than in USD, and mixing it in
+    would corrupt every liquidity comparison.
+    """
+    out: list[Observation] = []
+    for product in ("USDT-FUTURES", "USDC-FUTURES"):
+        try:
+            rows = _get("https://api.bitget.com/api/v2/mix/market/tickers",
+                        {"productType": product})["data"]
+        except (VenueError, KeyError):
+            continue          # one product type failing must not lose the other
+        intervals: dict[str, float] = {}
+        try:
+            for c in _get("https://api.bitget.com/api/v2/mix/market/contracts",
+                          {"productType": product})["data"]:
+                intervals[c.get("symbol")] = _f(c.get("fundInterval"), 8.0) or 8.0
+        except (VenueError, KeyError):
+            pass
+        out.extend(Observation(
+            "bitget", PERP, r["symbol"], base_asset(r["symbol"]),
+            mark=_f(r.get("markPrice")), index=_f(r.get("indexPrice")),
+            funding_rate=_f(r.get("fundingRate")),
+            funding_interval_h=intervals.get(r["symbol"], 8.0),
+            turnover_musd=_f(r.get("usdtVolume")) / 1e6,
+            oi_musd=_f(r.get("holdingAmount")) * _f(r.get("markPrice")) / 1e6)
+            for r in rows)
+    return out
 
 
 def bitget_spot() -> list[Observation]:
@@ -475,11 +502,28 @@ def bitget_spot() -> list[Observation]:
 
 def mexc_perp() -> list[Observation]:
     rows = _get("https://contract.mexc.com/api/v1/contract/ticker")["data"]
+    # Same trap as Bitget, and larger: only 474 of 1030 MEXC symbols settle
+    # every 8h. 547 are 4h and 8 are hourly, so the old blanket 8.0 understated
+    # the majority of this venue — the second largest in the archive — by 2-8x.
+    # contract/funding_rate accepts no symbol and returns all of them at once.
+    cycles: dict[str, float] = {}
+    try:
+        for c in _get("https://contract.mexc.com/api/v1/contract/funding_rate")["data"]:
+            cycles[c.get("symbol")] = _f(c.get("collectCycle"), 8.0) or 8.0
+    except (VenueError, KeyError):
+        pass
+    # _USDC was excluded by the old _USDT-only filter — 78 linear contracts,
+    # including USDC-margined BTC and ETH, missing from the archive. Two quotes
+    # stay out deliberately: _USD is inverse (coin-margined, turnover in coin,
+    # not comparable), and _USD1 normalises to a broken base — BTC_USD1 becomes
+    # "BTCUSD1", which would match nothing and silently drop out of every
+    # cross-venue comparison, the exact failure mode fixed for OKX above.
     return [Observation("mexc", PERP, r["symbol"], base_asset(r["symbol"]),
                         mark=_f(r.get("lastPrice")), index=_f(r.get("indexPrice")),
-                        funding_rate=_f(r.get("fundingRate")), funding_interval_h=8.0,
+                        funding_rate=_f(r.get("fundingRate")),
+                        funding_interval_h=cycles.get(r["symbol"], 8.0),
                         turnover_musd=_f(r.get("amount24")) / 1e6)
-            for r in rows if str(r.get("symbol", "")).endswith("_USDT")]
+            for r in rows if str(r.get("symbol", "")).endswith(("_USDT", "_USDC"))]
 
 
 def mexc_spot() -> list[Observation]:
@@ -546,6 +590,45 @@ def htx_perp() -> list[Observation]:
     return out
 
 
+def whitebit_perp() -> list[Observation]:
+    """One call carries funding, interval, index, turnover and OI together.
+
+    The interval is per instrument and mostly NOT 8h — 219 of 396 symbols settle
+    every 4h and two hourly — so the usual blanket assumption would misannualise
+    most of this venue.
+    """
+    rows = _get("https://whitebit.com/api/v4/public/futures")["result"]
+    out = []
+    for r in rows:
+        sym = str(r.get("ticker_id", ""))
+        if not sym:
+            continue
+        px = _f(r.get("last_price"))
+        out.append(Observation(
+            "whitebit", PERP, sym, base_asset(sym),
+            mark=px, index=_f(r.get("index_price")),
+            funding_rate=_f(r.get("funding_rate")),
+            # minutes, not hours; `or 480` because a reported 0 would annualise
+            # to zero rather than fall back to the documented default
+            funding_interval_h=(_f(r.get("funding_interval_minutes"), 480) or 480) / 60,
+            next_funding=_ms_to_iso(r.get("next_funding_rate_timestamp")),
+            turnover_musd=_f(r.get("money_volume")) / 1e6,
+            oi_musd=_f(r.get("open_interest")) * px / 1e6))
+    return out
+
+
+def whitebit_spot() -> list[Observation]:
+    # The ticker endpoint returns perps and spot in one map, keyed by symbol;
+    # the _PERP entries are already covered by whitebit_perp and would be
+    # counted twice as a spot hedge leg that does not exist.
+    rows = _get("https://whitebit.com/api/v4/public/ticker")
+    return [Observation("whitebit", SPOT, sym, base_asset(sym),
+                        mark=_f(t.get("last_price")),
+                        turnover_musd=_f(t.get("quote_volume")) / 1e6)
+            for sym, t in rows.items()
+            if sym.endswith(("_USDT", "_USDC")) and isinstance(t, dict)]
+
+
 def coinex_perp() -> list[Observation]:
     rows = _get("https://api.coinex.com/v2/futures/funding-rate")["data"]
     tick: dict[str, dict] = {}
@@ -568,6 +651,18 @@ def coinex_perp() -> list[Observation]:
     return out
 
 
+def _bitmex_interval(raw: object) -> float:
+    """BitMEX encodes the interval as a datetime whose TIME part is the period:
+    "2000-01-01T08:00:00.000Z" means 8h. Every active contract reads 8h today,
+    so this changes nothing now — it is here so that a venue which moves a
+    symbol to 4h is followed rather than silently annualised at the old rate."""
+    m = re.search(r"T(\d{2}):(\d{2})", str(raw or ""))
+    if not m:
+        return 8.0
+    hours = int(m.group(1)) + int(m.group(2)) / 60
+    return hours if 0.5 <= hours <= 24 else 8.0
+
+
 def bitmex_perp() -> list[Observation]:
     rows = _get("https://www.bitmex.com/api/v1/instrument/active")
     out = []
@@ -580,7 +675,8 @@ def bitmex_perp() -> list[Observation]:
         out.append(Observation(
             "bitmex", PERP, r["symbol"], base_asset(r["symbol"]),
             mark=_f(r.get("markPrice")), index=_f(r.get("indicativeSettlePrice")),
-            funding_rate=_f(r.get("fundingRate")), funding_interval_h=8.0,
+            funding_rate=_f(r.get("fundingRate")),
+            funding_interval_h=_bitmex_interval(r.get("fundingInterval")),
             turnover_musd=_f(r.get("foreignNotional24h")) / 1e6))
     return out
 
@@ -732,6 +828,7 @@ ADAPTERS: dict[str, dict[str, object]] = {
     "mexc": {PERP: mexc_perp, SPOT: mexc_spot},
     "kucoin": {PERP: kucoin_perp, SPOT: kucoin_spot},
     "htx": {PERP: htx_perp},
+    "whitebit": {PERP: whitebit_perp, SPOT: whitebit_spot},
     "coinex": {PERP: coinex_perp},
     "bitmex": {PERP: bitmex_perp},
     "bingx": {PERP: bingx_perp},
