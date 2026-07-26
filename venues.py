@@ -341,8 +341,30 @@ def _okx_tickers(inst_type: str) -> dict[str, dict]:
                  {"instType": inst_type})["data"]}
 
 
+def _okx_marks(inst_type: str) -> dict[str, float]:
+    """OKX's own mark price, which `last` is not.
+
+    `last` is the most recent PRINT, and on a contract nobody trades it can be
+    a day old: XAU-USD_UM-260731 last-traded at 4778.1 against a mark of
+    4087.7, a 17% error, and BTC-USD_UM-270326 has never traded at all so its
+    last is 0. Two contracts with different expiries were carrying the identical
+    stale print, which the calendar-basis section then read as a 30% premium.
+
+    Preferred over mid(bid, ask) because it is defined even when the book is
+    one-sided or empty, which is exactly the case on the contracts that were
+    producing the phantom numbers.
+    """
+    try:
+        return {m["instId"]: _f(m.get("markPx")) for m in
+                _get("https://www.okx.com/api/v5/public/mark-price",
+                     {"instType": inst_type})["data"]}
+    except (VenueError, KeyError):
+        return {}
+
+
 def okx_perp() -> list[Observation]:
     tick = _okx_tickers("SWAP")
+    marks = _okx_marks("SWAP")
     insts = _get("https://www.okx.com/api/v5/public/instruments",
                  {"instType": "SWAP"})["data"]
     # Funding is per-instrument on OKX, so only the liquid head is queried.
@@ -369,7 +391,8 @@ def okx_perp() -> list[Observation]:
             interval = gap
         t = tick.get(inst, {})
         out.append(Observation(
-            "okx", PERP, inst, base_asset(inst), mark=_f(t.get("last")),
+            "okx", PERP, inst, base_asset(inst),
+            mark=marks.get(inst) or _f(t.get("last")),
             funding_rate=_f(d.get("fundingRate")), funding_interval_h=interval,
             next_funding=_ms_to_iso(d.get("nextFundingTime")),
             turnover_musd=_f(t.get("volCcy24h")) * _f(t.get("last")) / 1e6))
@@ -384,13 +407,19 @@ def okx_perp() -> list[Observation]:
 
 def okx_future() -> list[Observation]:
     tick = _okx_tickers("FUTURES")
+    marks = _okx_marks("FUTURES")
     out = []
     for i in _get("https://www.okx.com/api/v5/public/instruments",
                   {"instType": "FUTURES"})["data"]:
         inst = i["instId"]
         t = tick.get(inst, {})
+        # index carries `last` deliberately: it is the wrong number for a mark
+        # but a useful record of how stale the book is, and keeping both makes
+        # the divergence measurable from the archive instead of invisible.
         out.append(Observation(
-            "okx", FUTURE, inst, base_asset(inst), mark=_f(t.get("last")),
+            "okx", FUTURE, inst, base_asset(inst),
+            mark=marks.get(inst) or _f(t.get("last")),
+            index=_f(t.get("last")),
             expiry=_ms_to_iso(i.get("expTime"))[:10],
             turnover_musd=_f(t.get("volCcy24h")) * _f(t.get("last")) / 1e6))
     return out

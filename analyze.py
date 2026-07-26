@@ -50,6 +50,17 @@ DEFAULT_FEE = 0.055
 SPOT_FEE_PCT = 0.10
 RISK_FREE_PCT = 3.81   # 3M T-bill; refresh from federalreserve.gov/releases/h15
 
+# The interest-rate floor every major venue falls back to when the premium is
+# negligible: 0.01%/8h == 0.005%/4h == 0.00125%/1h. All three are the same
+# number per hour and all three annualise to exactly 10.95% APR, which is why
+# "11.0%" appears everywhere in an unfiltered ranking.
+#
+# 61% of perps sit exactly here at any given moment (whitebit 83%, gate 78%,
+# kucoin 74%, hyperliquid 70%). It is not a market signal — it is the venue
+# saying nothing is happening — so a "spread" against it is a real rate minus
+# a constant, not a trade.
+FUNDING_BASELINE_PER_H = 1.25e-5
+
 
 @dataclass(frozen=True)
 class Row:
@@ -71,6 +82,20 @@ class Row:
         if self.kind != PERP or self.funding_interval_h <= 0:
             return 0.0
         return self.funding_rate * (24 / self.funding_interval_h) * 365 * 100
+
+    @property
+    def at_baseline(self) -> bool:
+        """The venue is quoting its interest-rate floor, not a market rate.
+
+        Tested per HOUR rather than per interval, which is what makes one test
+        cover all of them: 8h, 4h and 1h venues use different raw numbers for
+        the same floor. Only the positive floor counts — the same magnitude
+        negative is a genuine reading, not a fallback.
+        """
+        if self.kind != PERP or self.funding_interval_h <= 0:
+            return False
+        return abs(self.funding_rate / self.funding_interval_h
+                   - FUNDING_BASELINE_PER_H) < 1e-9
 
 
 def _f(v: str) -> float:
@@ -312,11 +337,30 @@ def section_carry(snaps: dict[str, list[Row]], capital: float, top: int) -> None
 # --------------------------------------------------------------------------- #
 
 def section_cross(snaps: dict[str, list[Row]], capital: float, top: int,
-                  cycles: int) -> None:
+                  cycles: int, leg_turnover: float = 5.0,
+                  include_baseline: bool = False) -> None:
+    """Both legs must be tradeable, which is a stricter test than it sounds.
+
+    Two filters, each of which alone lets a phantom to the top of the table:
+
+    * BOTH legs need real turnover. Screening one leg ranks spreads whose other
+      side cannot be entered at size — and load() exempts zero-turnover rows
+      from --min-turnover entirely, so they arrive here unscreened.
+    * Neither leg may be sitting on the interest-rate floor. A venue quoting
+      10.95% because nothing is happening is not the second leg of a trade, and
+      three of the top fifteen spreads rested on exactly that.
+    """
     latest = list(snaps.values())[-1]
     by_base: dict[str, dict[str, Row]] = defaultdict(dict)
+    dropped_thin = dropped_baseline = 0
     for r in latest:
         if r.kind != PERP:
+            continue
+        if r.turnover_musd < leg_turnover:
+            dropped_thin += 1
+            continue
+        if r.at_baseline and not include_baseline:
+            dropped_baseline += 1
             continue
         cur = by_base[r.base].get(r.venue)
         if cur is None or r.turnover_musd > cur.turnover_musd:
@@ -338,8 +382,12 @@ def section_cross(snaps: dict[str, list[Row]], capital: float, top: int,
     print("\n" + "=" * 78)
     print("3. CROSS-VENUE SPREADS (latest) — long the low leg, short the high leg")
     print("=" * 78)
+    print(f"  both legs require >${leg_turnover:g}M turnover"
+          + ("" if include_baseline else " and a rate off the 10.95% floor"))
+    print(f"  excluded: {dropped_thin:,} thin quotes, "
+          f"{dropped_baseline:,} at the floor")
     if not spreads:
-        print("  no asset is quoted on two venues in this archive")
+        print("  nothing survives both filters — loosen --min-leg-turnover")
         return
     print(f"{'ASSET':<10}{'LONG @':<13}{'APR':>8}{'SHORT @':<13}{'APR':>8}"
           f"{'GROSS':>8}{'NET':>8}{'$/YR':>9}")
@@ -363,7 +411,8 @@ def section_cross(snaps: dict[str, list[Row]], capital: float, top: int,
 # 4. Calendar basis
 # --------------------------------------------------------------------------- #
 
-def section_basis(snaps: dict[str, list[Row]], top: int) -> None:
+def section_basis(snaps: dict[str, list[Row]], top: int,
+                  min_turnover: float = 1.0) -> None:
     latest = list(snaps.values())[-1]
     ts = latest[0].ts if latest else ""
     spot_px: dict[tuple[str, str], float] = {}
@@ -377,8 +426,16 @@ def section_basis(snaps: dict[str, list[Row]], top: int) -> None:
         any_spot.setdefault(base, px)
 
     rows = []
+    thin = 0
     for r in latest:
         if r.kind != FUTURE or r.mark <= 0 or not r.expiry:
+            continue
+        # A future nobody trades has no basis to measure. 143 of 179 turn over
+        # under $1M, and on those the printed premium was the age of the last
+        # trade rather than a market view — one contract read 30% purely
+        # because two expiries shared a stale print.
+        if r.turnover_musd < min_turnover:
+            thin += 1
             continue
         px = spot_px.get((r.venue, r.base)) or any_spot.get(r.base) or r.index
         if not px:
@@ -397,6 +454,7 @@ def section_basis(snaps: dict[str, list[Row]], top: int) -> None:
     print("\n" + "=" * 78)
     print("4. CALENDAR BASIS (latest) — long spot + short dated future, held to expiry")
     print("=" * 78)
+    print(f"  futures below ${min_turnover:g}M turnover excluded: {thin}")
     if not rows:
         print("  no dated futures with a usable spot reference in this archive")
         return
@@ -512,6 +570,13 @@ def main() -> None:
                    help="APR%% that counts as an opportunity (default: 15)")
     p.add_argument("--cycles", type=int, default=12,
                    help="assumed cross-venue round trips per year (default: 12)")
+    p.add_argument("--min-leg-turnover", type=float, default=5.0,
+                   help="cross-venue: BOTH legs must exceed this 24h turnover "
+                        "in $M (default: 5)")
+    p.add_argument("--include-baseline", action="store_true",
+                   help="cross-venue: keep quotes sitting on the 10.95%% "
+                        "interest-rate floor; excluded by default because they "
+                        "mean the venue is idle, not that a spread exists")
     p.add_argument("--top", type=int, default=15)
     p.add_argument("--section", default="all",
                    choices=["all", "coverage", "persistence", "carry",
@@ -535,9 +600,10 @@ def main() -> None:
     if want in ("all", "carry"):
         section_carry(snaps, args.capital, args.top)
     if want in ("all", "cross"):
-        section_cross(snaps, args.capital, args.top, args.cycles)
+        section_cross(snaps, args.capital, args.top, args.cycles,
+                      args.min_leg_turnover, args.include_baseline)
     if want in ("all", "basis"):
-        section_basis(snaps, args.top)
+        section_basis(snaps, args.top, args.min_turnover)
     if want in ("all", "paper"):
         section_paper(snaps, args.capital, args.threshold)
 
