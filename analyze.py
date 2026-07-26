@@ -49,6 +49,10 @@ TAKER_FEE_PCT = {
 }
 DEFAULT_FEE = 0.055
 SPOT_FEE_PCT = 0.10
+# One spot+perp round trip: buy and sell the spot, open and close the perp.
+# Derived rather than written out, because a literal here silently stops
+# agreeing with TAKER_FEE_PCT the moment a fee is edited.
+ROUND_TRIP_PCT = SPOT_FEE_PCT * 2 + DEFAULT_FEE * 2
 RISK_FREE_PCT = 3.81   # 3M T-bill; refresh from federalreserve.gov/releases/h15
 
 # The interest-rate floor every major venue falls back to when the premium is
@@ -180,6 +184,25 @@ def hours_between(a: str, b: str) -> float:
         return 0.0
 
 
+def percentile(values: list[float], q: float) -> float:
+    """Linear-interpolated percentile over an already-sorted list.
+
+    `values[int(len(values) * q)]` is not one: at four samples it returns the
+    maximum and labels it the 75th, and it overstates at every small n. That
+    matters most on a short archive — which is exactly when the sample IS
+    small, so the error arrives precisely when the number is least reliable
+    and reads as a longer typical episode than the data supports.
+    """
+    if not values:
+        return 0.0
+    if len(values) == 1:
+        return values[0]
+    pos = q * (len(values) - 1)
+    lo = int(pos)
+    hi = min(lo + 1, len(values) - 1)
+    return values[lo] + (values[hi] - values[lo]) * (pos - lo)
+
+
 def median_gap_hours(stamps: list[str]) -> float:
     """Typical spacing between snapshots. Everything downstream needs this:
     a gap materially larger than it is an outage, not a persisting position."""
@@ -278,7 +301,7 @@ def section_persistence(snaps: dict[str, list[Row]], threshold: float) -> None:
     broken = sum(1 for r in runs if r[4])
     print(f"  episodes       {len(runs)}   (scan interval {gap * 60:.0f} min)")
     print(f"  median         {statistics.median(durations):.1f}h")
-    print(f"  75th pct       {durations[int(len(durations) * 0.75)]:.1f}h")
+    print(f"  75th pct       {percentile(durations, 0.75):.1f}h")
     print(f"  longest        {durations[-1]:.1f}h")
     print(f"  under 4h       {sum(1 for d in durations if d < 4) / len(durations):.0%} "
           f"of episodes")
@@ -291,14 +314,14 @@ def section_persistence(snaps: dict[str, list[Row]], threshold: float) -> None:
         flag = "  (gap)" if was_broken else ""
         print(f"    {venue:<12}{symbol:<18}{hours:>7.1f}h   peak {peak:>8.1f}% APR{flag}")
 
-    # Break-even: at 0.31% round trip (spot+perp), how many hours of funding pay it?
-    # Hours of funding needed to pay a 0.31% spot+perp round trip. Both terms
-    # are in percent, so the APR is divided by hours-per-year and nothing else.
-    print("\n  Break-even hold vs the median episode "
-          f"({statistics.median(durations):.1f}h):")
+    # Hours of funding needed to pay one spot+perp round trip. Both terms are
+    # in percent, so the APR is divided by hours-per-year and nothing else.
+    median_h = statistics.median(durations)
+    print(f"\n  Break-even hold vs the median episode ({median_h:.1f}h), "
+          f"at a {ROUND_TRIP_PCT:.2f}% round trip:")
     for apr in (10, 25, 50, 100, 250):
-        hours_needed = 0.31 / (apr / (365 * 24))
-        verdict = "takeable" if hours_needed < statistics.median(durations) else "too slow"
+        hours_needed = ROUND_TRIP_PCT / (apr / (365 * 24))
+        verdict = "takeable" if hours_needed < median_h else "too slow"
         print(f"    {apr:>4}% APR -> needs {hours_needed:>7.1f}h "
               f"({hours_needed / 24:>5.1f}d) to cover fees   {verdict}")
 
