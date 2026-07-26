@@ -518,18 +518,24 @@ def htx_perp() -> list[Observation]:
     # which surfaced only as a KeyError and would have meant zero HTX rows,
     # forever, with nothing in the archive to show why.
     rows = _get("https://api.hbdm.com/linear-swap-api/v1/swap_batch_funding_rate")["data"]
-    vols: dict[str, float] = {}
+    ticks: dict[str, dict] = {}
     try:
         for t in _get("https://api.hbdm.com/linear-swap-ex/market/detail/batch_merged",
                       {"business_type": "swap"})["ticks"]:
-            vols[t.get("contract_code")] = _f(t.get("trade_turnover"))
+            ticks[t.get("contract_code")] = t
     except (VenueError, KeyError):
         pass
-    return [Observation("htx", PERP, r["contract_code"],
-                        base_asset(r["contract_code"]),
-                        funding_rate=_f(r.get("funding_rate")), funding_interval_h=8.0,
-                        turnover_musd=vols.get(r.get("contract_code"), 0.0) / 1e6)
-            for r in rows if str(r.get("contract_code", "")).endswith("USDT")]
+    out = []
+    for r in rows:
+        code = r.get("contract_code", "")
+        if not str(code).endswith("USDT"):
+            continue
+        t = ticks.get(code, {})
+        out.append(Observation("htx", PERP, code, base_asset(code),
+                               mark=_f(t.get("close")),
+                               funding_rate=_f(r.get("funding_rate")), funding_interval_h=8.0,
+                               turnover_musd=_f(t.get("trade_turnover")) / 1e6))
+    return out
 
 
 def coinex_perp() -> list[Observation]:
