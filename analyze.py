@@ -29,6 +29,7 @@ import argparse
 import csv
 import gzip
 import itertools
+import math
 import statistics
 import sys
 from collections import defaultdict
@@ -336,6 +337,44 @@ def section_carry(snaps: dict[str, list[Row]], capital: float, top: int) -> None
 # 3. Cross-venue dispersion
 # --------------------------------------------------------------------------- #
 
+def same_asset(legs: list[Row]) -> list[Row]:
+    """Drop legs whose price says they are a different asset wearing the ticker.
+
+    Contract multipliers are always exact powers of ten — 1000PEPE against PEPE
+    is 1000x, and those legs ARE the same asset with comparable funding. A price
+    ratio that is not a clean power of ten is not a contract size, it is a
+    collision: whitebit's CAT_PERP is Caterpillar Inc. at $883 and mexc's
+    CAT_USDT is the memecoin at $0.0000014, and pairing them produces a spread
+    between a machinery manufacturer and a cat.
+
+    Four of 748 multi-venue bases collide this way today (CAT, HK50, EDGE, BOB).
+    The largest cluster wins, so the four real memecoin legs survive and the
+    stock is the one dropped.
+    """
+    priced = [r for r in legs if r.mark > 0]
+    if len(priced) < 2:
+        return legs
+    # Bucket by order of magnitude, after removing the power-of-ten multiplier.
+    buckets: dict[int, list[Row]] = defaultdict(list)
+    for r in priced:
+        buckets[round(math.log10(r.mark))].append(r)
+    if len(buckets) == 1:
+        return legs
+    # Merge buckets that differ by a whole power of ten into their nearest
+    # neighbour chain, then keep the largest resulting group.
+    keys = sorted(buckets)
+    groups, current = [], [keys[0]]
+    for prev, k in zip(keys, keys[1:]):
+        if k - prev <= 4:          # 1e4 covers every real multiplier in use
+            current.append(k)
+        else:
+            groups.append(current)
+            current = [k]
+    groups.append(current)
+    best = max(groups, key=lambda g: sum(len(buckets[k]) for k in g))
+    return [r for k in best for r in buckets[k]]
+
+
 def section_cross(snaps: dict[str, list[Row]], capital: float, top: int,
                   cycles: int, leg_turnover: float = 5.0,
                   include_baseline: bool = False) -> None:
@@ -367,7 +406,13 @@ def section_cross(snaps: dict[str, list[Row]], capital: float, top: int,
             by_base[r.base][r.venue] = r
 
     spreads = []
-    for base, legs in by_base.items():
+    dropped_collision = 0
+    for base, all_legs in by_base.items():
+        if len(all_legs) < 2:
+            continue
+        kept = same_asset(list(all_legs.values()))
+        dropped_collision += len(all_legs) - len(kept)
+        legs = {r.venue: r for r in kept}
         if len(legs) < 2:
             continue
         hi = max(legs.values(), key=lambda r: r.apr)
@@ -385,7 +430,8 @@ def section_cross(snaps: dict[str, list[Row]], capital: float, top: int,
     print(f"  both legs require >${leg_turnover:g}M turnover"
           + ("" if include_baseline else " and a rate off the 10.95% floor"))
     print(f"  excluded: {dropped_thin:,} thin quotes, "
-          f"{dropped_baseline:,} at the floor")
+          f"{dropped_baseline:,} at the floor, "
+          f"{dropped_collision} ticker collisions")
     if not spreads:
         print("  nothing survives both filters — loosen --min-leg-turnover")
         return

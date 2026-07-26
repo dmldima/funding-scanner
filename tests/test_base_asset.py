@@ -184,5 +184,43 @@ class TestDegenerateInput(unittest.TestCase):
         self.assertEqual(base_asset("  btcusdt  "), "BTC")
 
 
+
+
+class TestTickerCollision(unittest.TestCase):
+    """Two different assets can wear the same ticker across venues, and the
+    price is what gives it away: contract multipliers are exact powers of ten,
+    a machinery manufacturer priced against a memecoin is not."""
+
+    @staticmethod
+    def _row(venue, symbol, mark):
+        from analyze import Row
+        return Row("t", venue, "perp", symbol, "CAT", "", mark, 0, 0, 8, 10, 0)
+
+    def test_caterpillar_is_not_the_cat_memecoin(self):
+        from analyze import same_asset
+        legs = [self._row("mexc", "CAT_USDT", 1.372e-06),
+                self._row("bitget", "1000CATUSDT", 0.001378),
+                self._row("kucoin", "10000CATUSDTM", 0.01377),
+                self._row("bingx", "1000CAT-USDT", 0.001377),
+                self._row("whitebit", "CAT_PERP", 883.17)]     # Caterpillar Inc.
+        kept = same_asset(legs)
+        self.assertEqual(len(kept), 4)
+        self.assertNotIn("whitebit", [r.venue for r in kept])
+
+    def test_real_multipliers_survive(self):
+        """kPEPE is 1000x PEPE and the two ARE comparable — dropping them
+        would break exactly the pairing base_asset exists to enable."""
+        from analyze import same_asset
+        legs = [self._row("bitget", "PEPEUSDT", 2.94e-06),
+                self._row("kucoin", "PEPEUSDTM", 2.94e-06),
+                self._row("hyperliquid", "kPEPE", 0.00294)]
+        self.assertEqual(len(same_asset(legs)), 3)
+
+    def test_single_leg_untouched(self):
+        from analyze import same_asset
+        legs = [self._row("mexc", "CAT_USDT", 1.372e-06)]
+        self.assertEqual(same_asset(legs), legs)
+
+
 if __name__ == "__main__":
     unittest.main()
