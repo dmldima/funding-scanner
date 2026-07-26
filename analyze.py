@@ -1,0 +1,524 @@
+#!/usr/bin/env python3
+"""Read the accumulated archive and answer the questions a snapshot cannot.
+
+A single scan tells you what a rate IS. Only the archive tells you how long it
+LASTS — and persistence is what decides everything, because a 60% spread that
+survives two hours is a loss after four fills, while a 12% spread that holds for
+a month is a business.
+
+Sections:
+  0. Coverage        — what the archive actually contains
+  1. Persistence     — how long opportunities survive above a threshold
+  2. Funding carry   — single venue, perp funding hedged with spot
+  3. Cross-venue     — perp vs perp, and which venues supply the dispersion
+  4. Calendar basis  — dated futures vs spot, annualised to expiry
+  5. Paper run       — what a naive always-take-the-best rule would have earned
+
+Nothing here trades. It reports, and it reports its own sample size so a
+conclusion drawn from six hours of data is visibly that.
+
+Usage:
+    python3 analyze.py
+    python3 analyze.py --capital 10000 --min-turnover 1
+    python3 analyze.py --section persistence
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import gzip
+import itertools
+import statistics
+import sys
+from collections import defaultdict
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+
+PERP, SPOT, FUTURE = "perp", "spot", "future"
+
+# Perp taker fee per side. A cross-venue round trip is four fills.
+TAKER_FEE_PCT = {
+    "binance": 0.050, "bybit": 0.055, "okx": 0.050, "bitget": 0.060,
+    "gate": 0.050, "mexc": 0.020, "kucoin": 0.060, "htx": 0.040,
+    "bitmex": 0.075, "coinex": 0.050, "bingx": 0.050, "deribit": 0.050,
+    "hyperliquid": 0.045, "dydx": 0.050, "paradex": 0.030, "backpack": 0.050,
+}
+DEFAULT_FEE = 0.055
+SPOT_FEE_PCT = 0.10
+RISK_FREE_PCT = 3.81   # 3M T-bill; refresh from federalreserve.gov/releases/h15
+
+
+@dataclass(frozen=True)
+class Row:
+    ts: str
+    venue: str
+    kind: str
+    symbol: str
+    base: str
+    expiry: str
+    mark: float
+    index: float
+    funding_rate: float
+    funding_interval_h: float
+    turnover_musd: float
+    oi_musd: float
+
+    @property
+    def apr(self) -> float:
+        if self.kind != PERP or self.funding_interval_h <= 0:
+            return 0.0
+        return self.funding_rate * (24 / self.funding_interval_h) * 365 * 100
+
+
+def _f(v: str) -> float:
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def load(data_dir: Path, min_turnover: float) -> list[Row]:
+    files = sorted(data_dir.glob("*.csv.gz"))
+    if not files:
+        print(f"No data in {data_dir}/ — run scan.py first.", file=sys.stderr)
+        sys.exit(1)
+    rows: list[Row] = []
+    for path in files:
+        try:
+            with gzip.open(path, "rt", encoding="utf-8", newline="") as fh:
+                for rec in csv.DictReader(fh):
+                    # Concatenated gzip members repeat no header, but a re-created
+                    # file might; skip any row that is obviously the header again.
+                    if rec.get("ts") == "ts":
+                        continue
+                    turnover = _f(rec.get("turnover_musd", ""))
+                    # A reported 0 means the venue publishes no volume
+                    # (BingX, HTX), not that nobody trades it. Dropping
+                    # those would bias the archive against exactly the
+                    # small venues this project exists to examine.
+                    if (rec.get("kind") == PERP and turnover > 0
+                            and turnover < min_turnover):
+                        continue
+                    rows.append(Row(
+                        rec["ts"], rec["venue"], rec["kind"], rec["symbol"],
+                        rec["base"], rec.get("expiry", ""),
+                        _f(rec.get("mark", "")), _f(rec.get("index", "")),
+                        _f(rec.get("funding_rate", "")),
+                        _f(rec.get("funding_interval_h", "")),
+                        turnover, _f(rec.get("oi_musd", ""))))
+        except (OSError, EOFError, csv.Error) as exc:
+            print(f"  ! unreadable, skipped: {path.name}: {exc}", file=sys.stderr)
+    return rows
+
+
+def by_timestamp(rows: list[Row]) -> dict[str, list[Row]]:
+    snapshots: dict[str, list[Row]] = defaultdict(list)
+    for r in rows:
+        snapshots[r.ts].append(r)
+    return dict(sorted(snapshots.items()))
+
+
+def fee(venue: str) -> float:
+    return TAKER_FEE_PCT.get(venue, DEFAULT_FEE)
+
+
+def hours_between(a: str, b: str) -> float:
+    try:
+        return abs((datetime.fromisoformat(b) - datetime.fromisoformat(a))
+                   .total_seconds()) / 3600
+    except (ValueError, TypeError):
+        return 0.0
+
+
+def median_gap_hours(stamps: list[str]) -> float:
+    """Typical spacing between snapshots. Everything downstream needs this:
+    a gap materially larger than it is an outage, not a persisting position."""
+    gaps = [hours_between(a, b) for a, b in itertools.pairwise(stamps)]
+    gaps = [g for g in gaps if g > 0]
+    return statistics.median(gaps) if gaps else 0.5
+
+
+# --------------------------------------------------------------------------- #
+# 0. Coverage
+# --------------------------------------------------------------------------- #
+
+def section_coverage(rows: list[Row], snaps: dict[str, list[Row]]) -> float:
+    stamps = list(snaps)
+    span_h = hours_between(stamps[0], stamps[-1]) if len(stamps) > 1 else 0.0
+    median_gap = median_gap_hours(stamps)
+
+    venues = sorted({r.venue for r in rows})
+    kinds: dict[str, int] = defaultdict(int)
+    for r in rows:
+        kinds[r.kind] += 1
+
+    print("=" * 78)
+    print("0. COVERAGE")
+    print("=" * 78)
+    print(f"  snapshots      {len(stamps)}")
+    print(f"  span           {span_h:.1f}h ({span_h / 24:.1f} days)")
+    print(f"  median gap     {median_gap * 60:.0f} min")
+    print(f"  rows           {len(rows):,}  "
+          f"({', '.join(f'{k}={v:,}' for k, v in sorted(kinds.items()))})")
+    print(f"  venues ({len(venues)})   {', '.join(venues)}")
+    if span_h < 48:
+        print("\n  WARNING: under two days of history. Persistence numbers below are")
+        print("  indicative only — nothing here is a basis for committing capital yet.")
+    return span_h
+
+
+# --------------------------------------------------------------------------- #
+# 1. Persistence — the reason the archive exists
+# --------------------------------------------------------------------------- #
+
+def section_persistence(snaps: dict[str, list[Row]], threshold: float) -> None:
+    """For each (venue, symbol), measure unbroken runs of |APR| above threshold.
+
+    Two corrections that decide whether this number means anything:
+
+    * A pair missing from intermediate snapshots — venue geo-blocked, adapter
+      failed, cron skipped — must BREAK the run. Without that, a three-day
+      outage reads as a three-day persisting opportunity, which is exactly the
+      headline this section exists to produce and exactly the wrong one.
+    * A run seen in a single snapshot lasted at least one scan interval, not
+      zero hours. Recording it as 0.0h drags the median toward "nothing lasts".
+    """
+    stamps = list(snaps)
+    gap = median_gap_hours(stamps)
+    max_gap = gap * 2.5
+
+    series: dict[tuple[str, str], list[tuple[str, float]]] = defaultdict(list)
+    for ts, batch in snaps.items():
+        for r in batch:
+            if r.kind == PERP:
+                series[(r.venue, r.symbol)].append((ts, r.apr))
+
+    runs: list[tuple[float, str, str, float, bool]] = []
+    for (venue, symbol), points in series.items():
+        start: str | None = None
+        prev_ts: str | None = None
+        peak = 0.0
+
+        for ts, apr in points:
+            stale = prev_ts is not None and hours_between(prev_ts, ts) > max_gap
+            hot = abs(apr) >= threshold
+            if start is not None and (stale or not hot):
+                # Floor at one scan interval: an episode seen in a single
+                # snapshot lasted at least that, not zero hours.
+                runs.append((max(hours_between(start, prev_ts), gap),
+                             venue, symbol, peak, stale))
+                start = None
+            if hot and start is None:
+                start, peak = ts, abs(apr)
+            elif hot:
+                peak = max(peak, abs(apr))
+            prev_ts = ts
+        if start is not None:
+            runs.append((max(hours_between(start, points[-1][0]), gap),
+                         venue, symbol, peak, False))
+
+    print("\n" + "=" * 78)
+    print(f"1. PERSISTENCE — how long |funding APR| stays above {threshold:.0f}%")
+    print("=" * 78)
+    if not runs:
+        print(f"  no pair exceeded {threshold:.0f}% APR in the whole archive")
+        return
+
+    durations = sorted(r[0] for r in runs)
+    broken = sum(1 for r in runs if r[4])
+    print(f"  episodes       {len(runs)}   (scan interval {gap * 60:.0f} min)")
+    print(f"  median         {statistics.median(durations):.1f}h")
+    print(f"  75th pct       {durations[int(len(durations) * 0.75)]:.1f}h")
+    print(f"  longest        {durations[-1]:.1f}h")
+    print(f"  under 4h       {sum(1 for d in durations if d < 4) / len(durations):.0%} "
+          f"of episodes")
+    if broken:
+        print(f"  gap-truncated  {broken} episodes ended at a data gap, not a "
+              f"rate change — those durations are lower bounds")
+
+    print("\n  Longest episodes:")
+    for hours, venue, symbol, peak, was_broken in sorted(runs, reverse=True)[:8]:
+        flag = "  (gap)" if was_broken else ""
+        print(f"    {venue:<12}{symbol:<18}{hours:>7.1f}h   peak {peak:>8.1f}% APR{flag}")
+
+    # Break-even: at 0.31% round trip (spot+perp), how many hours of funding pay it?
+    # Hours of funding needed to pay a 0.31% spot+perp round trip. Both terms
+    # are in percent, so the APR is divided by hours-per-year and nothing else.
+    print("\n  Break-even hold vs the median episode "
+          f"({statistics.median(durations):.1f}h):")
+    for apr in (10, 25, 50, 100, 250):
+        hours_needed = 0.31 / (apr / (365 * 24))
+        verdict = "takeable" if hours_needed < statistics.median(durations) else "too slow"
+        print(f"    {apr:>4}% APR -> needs {hours_needed:>7.1f}h "
+              f"({hours_needed / 24:>5.1f}d) to cover fees   {verdict}")
+
+
+# --------------------------------------------------------------------------- #
+# 2. Funding carry, single venue
+# --------------------------------------------------------------------------- #
+
+def section_carry(snaps: dict[str, list[Row]], capital: float, top: int) -> None:
+    if not snaps:
+        print('\n  (no snapshots after filtering)')
+        return
+    if not snaps:
+        print('\n  (no snapshots after filtering)')
+        return
+    if not snaps:
+        print('\n  (no snapshots after filtering)')
+        return
+    latest = list(snaps.values())[-1]
+    spot_keys = {(r.venue, r.base) for r in latest if r.kind == SPOT}
+
+    hedgeable = [r for r in latest
+                 if r.kind == PERP and (r.venue, r.base) in spot_keys and r.apr > 0]
+    hedgeable.sort(key=lambda r: r.apr, reverse=True)
+
+    print("\n" + "=" * 78)
+    print("2. FUNDING CARRY (latest snapshot) — long spot + short perp, same venue")
+    print("=" * 78)
+    if not hedgeable:
+        print("  no positive-funding perp has a spot market on the same venue")
+        return
+    print(f"{'VENUE':<12}{'SYMBOL':<18}{'INT':>5}{'APR':>9}{'NET*':>8}"
+          f"{'TURNOVER':>11}{'$/YR':>9}")
+    print("-" * 78)
+    for r in hedgeable[:top]:
+        # 4 rotations/yr, buffer 25% of notional -> notional = 0.8 x capital
+        net = 0.8 * (r.apr - (SPOT_FEE_PCT * 2 + fee(r.venue) * 2) * 4)
+        print(f"{r.venue:<12}{r.symbol:<18}{r.funding_interval_h:>4.0f}h"
+              f"{r.apr:>8.1f}%{net:>7.1f}%{r.turnover_musd:>10.0f}M"
+              f"{capital * net / 100:>8,.0f}")
+    print("  * net on capital, assuming a 25% margin buffer and 4 rotations/year")
+
+
+# --------------------------------------------------------------------------- #
+# 3. Cross-venue dispersion
+# --------------------------------------------------------------------------- #
+
+def section_cross(snaps: dict[str, list[Row]], capital: float, top: int,
+                  cycles: int) -> None:
+    latest = list(snaps.values())[-1]
+    by_base: dict[str, dict[str, Row]] = defaultdict(dict)
+    for r in latest:
+        if r.kind != PERP:
+            continue
+        cur = by_base[r.base].get(r.venue)
+        if cur is None or r.turnover_musd > cur.turnover_musd:
+            by_base[r.base][r.venue] = r
+
+    spreads = []
+    for base, legs in by_base.items():
+        if len(legs) < 2:
+            continue
+        hi = max(legs.values(), key=lambda r: r.apr)
+        lo = min(legs.values(), key=lambda r: r.apr)
+        if hi.venue == lo.venue:
+            continue
+        gross = hi.apr - lo.apr
+        fees = (fee(hi.venue) + fee(lo.venue)) * 2 * cycles
+        spreads.append((gross - fees, base, lo, hi, gross, fees, len(legs)))
+    spreads.sort(reverse=True, key=lambda s: s[0])
+
+    print("\n" + "=" * 78)
+    print("3. CROSS-VENUE SPREADS (latest) — long the low leg, short the high leg")
+    print("=" * 78)
+    if not spreads:
+        print("  no asset is quoted on two venues in this archive")
+        return
+    print(f"{'ASSET':<10}{'LONG @':<13}{'APR':>8}{'SHORT @':<13}{'APR':>8}"
+          f"{'GROSS':>8}{'NET':>8}{'$/YR':>9}")
+    print("-" * 78)
+    for net, base, lo, hi, gross, _fees, _n in spreads[:top]:
+        print(f"{base:<10}{lo.venue:<13}{lo.apr:>7.1f}%{hi.venue:<13}{hi.apr:>7.1f}%"
+              f"{gross:>7.1f}%{net:>7.1f}%{capital * net / 100:>8,.0f}")
+
+    contributions: dict[str, int] = defaultdict(int)
+    for _net, _b, lo, hi, _g, _f2, _n in spreads[:40]:
+        contributions[lo.venue] += 1
+        contributions[hi.venue] += 1
+    print("\n  Which venues supply the dispersion (appearances in the top 40):")
+    for venue, n in sorted(contributions.items(), key=lambda x: -x[1])[:10]:
+        print(f"    {venue:<14}{n:>4}")
+    print("  Not modelled: basis divergence between the two venues. It is the "
+          "dominant\n  risk here and can exceed the whole spread.")
+
+
+# --------------------------------------------------------------------------- #
+# 4. Calendar basis
+# --------------------------------------------------------------------------- #
+
+def section_basis(snaps: dict[str, list[Row]], top: int) -> None:
+    latest = list(snaps.values())[-1]
+    ts = latest[0].ts if latest else ""
+    spot_px: dict[tuple[str, str], float] = {}
+    for r in latest:
+        if r.kind == SPOT and r.mark > 0:
+            spot_px[(r.venue, r.base)] = r.mark
+    # Fall back to any venue's spot for the same asset when the future's own
+    # venue has no spot market — Deribit being the case that matters.
+    any_spot: dict[str, float] = {}
+    for (_v, base), px in spot_px.items():
+        any_spot.setdefault(base, px)
+
+    rows = []
+    for r in latest:
+        if r.kind != FUTURE or r.mark <= 0 or not r.expiry:
+            continue
+        px = spot_px.get((r.venue, r.base)) or any_spot.get(r.base) or r.index
+        if not px:
+            continue
+        try:
+            days = (datetime.fromisoformat(r.expiry).date()
+                    - datetime.fromisoformat(ts[:10]).date()).days
+        except ValueError:
+            continue
+        if days <= 0:
+            continue
+        basis = (r.mark - px) / px * 100
+        rows.append((basis * 365 / days, r, days, basis))
+    rows.sort(reverse=True, key=lambda x: x[0])
+
+    print("\n" + "=" * 78)
+    print("4. CALENDAR BASIS (latest) — long spot + short dated future, held to expiry")
+    print("=" * 78)
+    if not rows:
+        print("  no dated futures with a usable spot reference in this archive")
+        return
+    print(f"{'VENUE':<11}{'SYMBOL':<22}{'EXPIRY':<12}{'DAYS':>6}{'BASIS':>8}"
+          f"{'ANN':>8}{'NET**':>8}")
+    print("-" * 78)
+    for ann, r, days, basis in rows[:top]:
+        net = (basis - (SPOT_FEE_PCT * 2 + fee(r.venue))) * 365 / days
+        print(f"{r.venue:<11}{r.symbol:<22}{r.expiry:<12}{days:>6}"
+              f"{basis:>7.2f}%{ann:>7.2f}%{net:>7.2f}%")
+    print(f"  ** held to settlement, so the future costs no closing fee. "
+          f"Risk-free is {RISK_FREE_PCT}%.")
+
+
+# --------------------------------------------------------------------------- #
+# 5. Paper run
+# --------------------------------------------------------------------------- #
+
+def section_paper(snaps: dict[str, list[Row]], capital: float,
+                  threshold: float) -> None:
+    """Naive rule: hold the single best hedgeable carry, switch when it decays.
+
+    Deliberately naive — it exists to bound the opportunity, not to be a strategy.
+    It charges a full round trip on every switch, which is the cost that kills
+    real bots, and it ignores slippage, which flatters it.
+    """
+    stamps = list(snaps)
+    if len(stamps) < 3:
+        print("\n5. PAPER RUN — need at least 3 snapshots")
+        return
+
+    gap = median_gap_hours(stamps)
+    max_gap = gap * 2.5
+
+    held: Row | None = None
+    pnl_pct = 0.0
+    switches = 0
+    counted_h = 0.0
+    skipped_h = 0.0
+
+    for i in range(1, len(stamps)):
+        prev_ts, ts = stamps[i - 1], stamps[i]
+        dt_h = hours_between(prev_ts, ts)
+        batch = snaps[ts]
+        spot_keys = {(r.venue, r.base) for r in batch if r.kind == SPOT}
+        cands = [r for r in batch if r.kind == PERP
+                 and (r.venue, r.base) in spot_keys and r.apr > threshold]
+
+        if dt_h > max_gap:
+            # A scanner outage is not a held position. Crediting funding across
+            # it — at the rate observed after the gap, no less — invents returns.
+            skipped_h += dt_h
+            held = None
+            continue
+
+        if held is not None:
+            # kind == PERP is load-bearing: on Binance/Bybit/MEXC the spot and
+            # perp symbols are the identical string, and matching the spot row
+            # gives apr == 0, force-closing and re-entering every single
+            # snapshot. Which row won depended on thread completion order, so
+            # the same archive produced a different answer on every run.
+            live = next((r for r in batch if r.kind == PERP
+                         and r.venue == held.venue and r.symbol == held.symbol), None)
+            if live is None or live.apr < threshold:
+                held = None
+            else:
+                # Accrue at the rate observed at the START of the interval —
+                # using the end rate is look-ahead bias.
+                pnl_pct += held.apr / 100 / 365 / 24 * dt_h * 100
+                counted_h += dt_h
+                held = live
+
+        if held is None and cands:
+            best = max(cands, key=lambda r: r.apr)
+            pnl_pct -= SPOT_FEE_PCT * 2 + fee(best.venue) * 2
+            switches += 1
+            held = best
+
+    span_h = hours_between(stamps[0], stamps[-1]) - skipped_h
+    annualised = pnl_pct * (365 * 24 / span_h) if span_h > 0 else 0.0
+
+    print("\n" + "=" * 78)
+    print("5. PAPER RUN — always hold the single best hedgeable carry")
+    print("=" * 78)
+    print(f"  window            {span_h:.1f}h usable"
+          + (f"  ({skipped_h:.1f}h skipped as data gaps)" if skipped_h else ""))
+    print(f"  entries           {switches}")
+    print(f"  time in position  {counted_h:.1f}h "
+          f"({counted_h / span_h * 100 if span_h else 0:.0f}%)")
+    print(f"  realised          {pnl_pct:+.3f}% on notional")
+    print(f"  annualised        {annualised:+.1f}%   (on ${capital:,.0f}: "
+          f"${capital * annualised / 100:+,.0f}/yr)")
+    print(f"  vs risk-free      {annualised - RISK_FREE_PCT:+.1f}%")
+    if span_h < 168:
+        print("\n  Too short to mean anything. This number becomes informative at "
+              "~4 weeks;\n  before that it mostly measures which day you started on.")
+
+
+# --------------------------------------------------------------------------- #
+
+def main() -> None:
+    p = argparse.ArgumentParser(description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--data-dir", type=Path, default=Path("data"))
+    p.add_argument("--capital", type=float, default=10_000)
+    p.add_argument("--min-turnover", type=float, default=1.0,
+                   help="ignore perps below this 24h turnover in $M (default: 1)")
+    p.add_argument("--threshold", type=float, default=15.0,
+                   help="APR%% that counts as an opportunity (default: 15)")
+    p.add_argument("--cycles", type=int, default=12,
+                   help="assumed cross-venue round trips per year (default: 12)")
+    p.add_argument("--top", type=int, default=15)
+    p.add_argument("--section", default="all",
+                   choices=["all", "coverage", "persistence", "carry",
+                            "cross", "basis", "paper"],
+                   help="which section to print (default: all)")
+    args = p.parse_args()
+
+    rows = load(args.data_dir, args.min_turnover)
+    snaps = by_timestamp(rows)
+    want = args.section
+
+    if want in ("all", "coverage"):
+        section_coverage(rows, snaps)
+    if want in ("all", "persistence"):
+        section_persistence(snaps, args.threshold)
+    if want in ("all", "carry"):
+        section_carry(snaps, args.capital, args.top)
+    if want in ("all", "cross"):
+        section_cross(snaps, args.capital, args.top, args.cycles)
+    if want in ("all", "basis"):
+        section_basis(snaps, args.top)
+    if want in ("all", "paper"):
+        section_paper(snaps, args.capital, args.threshold)
+
+
+if __name__ == "__main__":
+    main()
