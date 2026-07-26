@@ -79,12 +79,14 @@ def _f(v: str) -> float:
         return 0.0
 
 
-def load(data_dir: Path, min_turnover: float) -> list[Row]:
+def load(data_dir: Path, min_turnover: float,
+         drop_unknown_turnover: bool = False) -> list[Row]:
     files = sorted(data_dir.glob("*.csv.gz"))
     if not files:
         print(f"No data in {data_dir}/ — run scan.py first.", file=sys.stderr)
         sys.exit(1)
     rows: list[Row] = []
+    unknown: dict[str, int] = defaultdict(int)
     for path in files:
         try:
             with gzip.open(path, "rt", encoding="utf-8", newline="") as fh:
@@ -94,11 +96,20 @@ def load(data_dir: Path, min_turnover: float) -> list[Row]:
                     if rec.get("ts") == "ts":
                         continue
                     turnover = _f(rec.get("turnover_musd", ""))
-                    # A reported 0 means the venue publishes no volume
-                    # (BingX, HTX), not that nobody trades it. Dropping
-                    # those would bias the archive against exactly the
+                    # A reported 0 means the venue published no volume for that
+                    # instrument, not that nobody trades it, so these are kept by
+                    # default — dropping them would bias the archive against the
                     # small venues this project exists to examine.
-                    if (rec.get("kind") == PERP and turnover > 0
+                    #
+                    # But keeping them silently is worse: they are exempt from
+                    # min_turnover, so a liquidity filter does not apply to them
+                    # at all and they can dominate a table the user believes was
+                    # screened. They are counted here and reported by the caller.
+                    if rec.get("kind") == PERP and turnover <= 0:
+                        unknown[rec.get("venue", "?")] += 1
+                        if drop_unknown_turnover:
+                            continue
+                    elif (rec.get("kind") == PERP and turnover > 0
                             and turnover < min_turnover):
                         continue
                     rows.append(Row(
@@ -110,6 +121,16 @@ def load(data_dir: Path, min_turnover: float) -> list[Row]:
                         turnover, _f(rec.get("oi_musd", ""))))
         except (OSError, EOFError, csv.Error) as exc:
             print(f"  ! unreadable, skipped: {path.name}: {exc}", file=sys.stderr)
+
+    if unknown and min_turnover > 0 and not drop_unknown_turnover:
+        total = sum(unknown.values())
+        top = ", ".join(f"{v}={n:,}" for v, n in
+                        sorted(unknown.items(), key=lambda x: -x[1])[:5])
+        print(f"  NOTE: {total:,} perp rows report no turnover and are therefore "
+              f"NOT screened by\n        --min-turnover {min_turnover:g}. "
+              f"Their liquidity is unverified: {top}."
+              f"\n        Re-run with --drop-unknown-turnover to exclude them.",
+              file=sys.stderr)
     return rows
 
 
@@ -260,15 +281,6 @@ def section_persistence(snaps: dict[str, list[Row]], threshold: float) -> None:
 # --------------------------------------------------------------------------- #
 
 def section_carry(snaps: dict[str, list[Row]], capital: float, top: int) -> None:
-    if not snaps:
-        print('\n  (no snapshots after filtering)')
-        return
-    if not snaps:
-        print('\n  (no snapshots after filtering)')
-        return
-    if not snaps:
-        print('\n  (no snapshots after filtering)')
-        return
     latest = list(snaps.values())[-1]
     spot_keys = {(r.venue, r.base) for r in latest if r.kind == SPOT}
 
@@ -491,6 +503,10 @@ def main() -> None:
     p.add_argument("--capital", type=float, default=10_000)
     p.add_argument("--min-turnover", type=float, default=1.0,
                    help="ignore perps below this 24h turnover in $M (default: 1)")
+    p.add_argument("--drop-unknown-turnover", action="store_true",
+                   help="also exclude perps whose venue reported no turnover; "
+                        "they are kept by default but are NOT screened by "
+                        "--min-turnover")
     p.add_argument("--threshold", type=float, default=15.0,
                    help="APR%% that counts as an opportunity (default: 15)")
     p.add_argument("--cycles", type=int, default=12,
@@ -502,8 +518,13 @@ def main() -> None:
                    help="which section to print (default: all)")
     args = p.parse_args()
 
-    rows = load(args.data_dir, args.min_turnover)
+    rows = load(args.data_dir, args.min_turnover, args.drop_unknown_turnover)
     snaps = by_timestamp(rows)
+    if not snaps:
+        print("No rows survived filtering — every section below would be empty.\n"
+              "Lower --min-turnover, or drop --drop-unknown-turnover.",
+              file=sys.stderr)
+        sys.exit(1)
     want = args.section
 
     if want in ("all", "coverage"):

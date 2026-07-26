@@ -113,12 +113,19 @@ _KIND_SUFFIX = ("PERPETUAL", "PERP", "SWAP")
 _MULT_PREFIX = re.compile(r"^(1000000|100000|10000|1000)(?=[A-Z])")
 _MULT_SUFFIX = re.compile(r"(1000000|100000|10000|1000)$")
 _EXPIRY_SUFFIX = re.compile(r"[-_]?(\d{6}|\d{8}|\d{1,2}[A-Z]{3}\d{2})$")
+# OKX marks its linear-settled dated futures _UM and its long-dated
+# perpetual-style contracts _UM_XPERP: BTC-USD_UM-260925, NVDA-USD_UM_XPERP-310613.
+# Stripped here, while the delimiter is still present, and deliberately NOT via
+# _KIND_SUFFIX: that runs after separators are removed, so a bare "UM" there
+# would also eat the tail of any ticker legitimately ending in those letters.
+_SETTLE_MARKER = re.compile(r"[-_](UM|XPERP)(?=[-_]|$)")
 
 
 def base_asset(raw: str) -> str:
     """Reduce a venue-specific symbol to a comparable base asset.
 
     BTCUSDT / BTC-USDT-SWAP / XBTUSDTM / BTC-PERP / BTCUSDT_261225 -> BTC
+    BTC-USD_UM-260925 / NVDA-USD_UM_XPERP-310613                   -> BTC / NVDA
     1000PEPEUSDT / PEPE1000USDT / kPEPE-USD                        -> PEPE
 
     Multiplier prefixes are stripped because 1000PEPE and PEPE are the same
@@ -140,6 +147,7 @@ def base_asset(raw: str) -> str:
         s = s[1:]                        # kPEPE -> PEPE, before .upper()
     s = s.upper()
     s = _EXPIRY_SUFFIX.sub("", s)
+    s = _SETTLE_MARKER.sub("", s)     # BTC-USD_UM -> BTC-USD, before separators go
     s = s.replace("XBT", "BTC")
     for sep in ("-", "_", "/", ":"):
         s = s.replace(sep, "")
@@ -579,13 +587,25 @@ def bitmex_perp() -> list[Observation]:
 
 def bingx_perp() -> list[Observation]:
     rows = _get("https://open-api.bingx.com/openApi/swap/v2/quote/premiumIndex")["data"]
+    # Turnover comes from a second call: premiumIndex carries no volume at all,
+    # and without it every BingX row landed in the archive at 0 turnover. That
+    # is not "BingX publishes no volume" — it does — and analyze.py exempts
+    # zero-turnover rows from --min-turnover, so all 792 of them were surviving
+    # every liquidity filter and dominating the cross-venue table.
+    vols: dict[str, float] = {}
+    try:
+        for t in _get("https://open-api.bingx.com/openApi/swap/v2/quote/ticker")["data"]:
+            vols[t.get("symbol")] = _f(t.get("quoteVolume"))
+    except (VenueError, KeyError):
+        pass
     # The interval is in this very response and a third of BingX symbols are 4h;
     # assuming 8h would have halved their APR in the archive permanently.
     return [Observation("bingx", PERP, r["symbol"], base_asset(r["symbol"]),
                         mark=_f(r.get("markPrice")), index=_f(r.get("indexPrice")),
                         funding_rate=_f(r.get("lastFundingRate")),
                         funding_interval_h=_f(r.get("fundingIntervalHours"), 8.0),
-                        next_funding=_ms_to_iso(r.get("nextFundingTime")))
+                        next_funding=_ms_to_iso(r.get("nextFundingTime")),
+                        turnover_musd=vols.get(r["symbol"], 0.0) / 1e6)
             for r in rows]
 
 
