@@ -39,6 +39,21 @@ class VenueError(RuntimeError):
     """A venue's API did not return usable data."""
 
 
+# OKX prices funding per instrument, one call each, so the whole list cannot be
+# fetched inside a scan interval — 150 already costs ~45s against 0.2-3s for
+# every other venue. The liquid head is kept and the tail is dropped.
+OKX_FUNDING_CAP = 150
+
+# Coverage caveats an adapter wants on the permanent record rather than in a
+# log line that dies with the runner. Nothing in the archive could otherwise
+# distinguish "OKX lists 150 perps" from "we sampled 150 of 411", and a later
+# coverage analysis would read a sampling decision as a market fact.
+#
+# list.append is atomic under CPython, which is the only reason a bare list is
+# safe here: adapters run concurrently in a thread pool.
+NOTES: list[tuple[str, str]] = []
+
+
 # --------------------------------------------------------------------------- #
 # HTTP
 # --------------------------------------------------------------------------- #
@@ -376,8 +391,11 @@ def okx_perp() -> list[Observation]:
     ranked = sorted(linear, key=lambda i: -_f(
         tick.get(i["instId"], {}).get("volCcy24h")) * _f(
         tick.get(i["instId"], {}).get("last")))
+    if len(ranked) > OKX_FUNDING_CAP:
+        NOTES.append(("okx:perp", f"CAPPED {OKX_FUNDING_CAP} of {len(ranked)} "
+                                  f"linear swaps by turnover"))
     out, skipped = [], 0
-    for i in ranked[:150]:
+    for i in ranked[:OKX_FUNDING_CAP]:
         inst = i["instId"]
         try:
             d = _get("https://www.okx.com/api/v5/public/funding-rate",

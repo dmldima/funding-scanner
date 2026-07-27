@@ -154,6 +154,11 @@ def log_status(status: dict[str, str], data_dir: Path, ts: str) -> Path:
             w.writerow(["ts", "source", "ok", "detail"])
         for source, detail in sorted(status.items()):
             w.writerow([ts, source, int(detail.startswith("ok")), detail])
+        # Coverage caveats an adapter raised — a deliberate cap is not a
+        # failure, so ok=1, but it belongs on the record next to the run it
+        # describes rather than only in the runner's log.
+        for source, detail in sorted(venues.NOTES):
+            w.writerow([ts, source, 1, detail])
     return path
 
 
@@ -197,6 +202,12 @@ def main() -> None:
                    help="comma-separated: perp,spot,future")
     p.add_argument("--data-dir", type=Path, default=Path("data"))
     p.add_argument("--workers", type=int, default=8)
+    p.add_argument("--okx-cap", type=int, default=venues.OKX_FUNDING_CAP,
+                   help=f"OKX prices funding one instrument at a time; this "
+                        f"many are fetched, ranked by turnover "
+                        f"(default: {venues.OKX_FUNDING_CAP}). Raising it costs "
+                        f"~0.3s per instrument and the cap is recorded in "
+                        f"venue_status.csv either way")
     p.add_argument("--dry-run", action="store_true", help="fetch but write nothing")
     p.add_argument("-v", "--verbose", action="store_true")
     args = p.parse_args()
@@ -208,6 +219,7 @@ def main() -> None:
         print(f"Unknown venues: {', '.join(unknown)}", file=sys.stderr)
         sys.exit(2)
     kinds = [k.strip().lower() for k in args.kinds.split(",") if k.strip()]
+    venues.OKX_FUNDING_CAP = args.okx_cap
 
     ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
     print(f"Scanning {len(selected)} venues at {ts}", file=sys.stderr)
