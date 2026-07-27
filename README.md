@@ -52,7 +52,31 @@ The three still assumed at 8h are a known limit, not a verified fact.
 3. Settings → Actions → General → Workflow permissions → **Read and write**.
 4. Actions tab → `scan` → **Run workflow** to trigger the first run by hand.
 
-After that it runs every 30 minutes and commits to `data/`.
+After that it runs on a schedule and commits to `data/`.
+
+### The scheduler will not keep time, and that is the reason to leave
+
+GitHub's `schedule:` trigger is best-effort. Runs queue behind every other
+repository's and are dropped outright under load — it is documented, and it is
+not subtle. Measured here over eight hours with `*/30`:
+
+```
+expected 16 runs        actual 2        largest gap 256 minutes
+```
+
+The workflow now fires at four odd minutes past the hour instead of `*/30`,
+which avoids the platform-wide stampede at `:00` and `:30` and gives four
+chances to land two runs. It helps. It does not make the scheduler a cron.
+
+This matters more than the geo-block. `analyze.py` handles gaps honestly — a
+missing snapshot breaks the run rather than being credited as four hours of a
+persisting spread — so irregular sampling never produces a *wrong* number. It
+produces a number with nothing in it. Measuring how long an opportunity survives
+requires sampling at a known cadence, and that is the entire question the
+archive exists to answer.
+
+A €4/month VPS running `crontab` fires every 30 minutes, every time. That is the
+fix; the staggered schedule is a stopgap.
 
 ## The one thing to check first
 

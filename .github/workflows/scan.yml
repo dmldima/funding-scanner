@@ -1,8 +1,24 @@
 name: scan
 
 on:
+  # GitHub's scheduler is best-effort, not a cron: runs queue behind everyone
+  # else's and are dropped outright under load. Measured on this repo, '*/30'
+  # produced 2 runs in 8 hours instead of 16, with a 256-minute gap.
+  #
+  # Two mitigations, neither of which is a fix. Odd minutes avoid the stampede
+  # at :00 and :30, when every default schedule on the platform fires at once.
+  # Four entries instead of one give four chances per hour to land two runs;
+  # the concurrency group below makes the surplus harmless, since a trigger
+  # arriving while a scan is running simply queues.
+  #
+  # If regular sampling actually matters — and for measuring how long a spread
+  # survives, it is the whole point — run scan.py from cron on a small VPS
+  # instead. See README.
   schedule:
-    - cron: '*/30 * * * *'
+    - cron: '3 * * * *'
+    - cron: '18 * * * *'
+    - cron: '33 * * * *'
+    - cron: '48 * * * *'
   workflow_dispatch: {}
 
 concurrency:

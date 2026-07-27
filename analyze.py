@@ -46,6 +46,8 @@ TAKER_FEE_PCT = {
     "bitmex": 0.075, "coinex": 0.050, "bingx": 0.050, "deribit": 0.050,
     "whitebit": 0.055,   # from /api/v4/public/markets, uniform across 303 perps
     "hyperliquid": 0.045, "dydx": 0.050, "paradex": 0.030, "backpack": 0.050,
+    # Published taker schedules, not read from an API — verify before sizing.
+    "aster": 0.035, "phemex": 0.060, "kraken": 0.050, "extended": 0.025,
 }
 DEFAULT_FEE = 0.055
 SPOT_FEE_PCT = 0.10

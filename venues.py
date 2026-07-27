@@ -121,7 +121,10 @@ def _ms_to_iso(value: object) -> str:
 # --------------------------------------------------------------------------- #
 
 # Longest first — KuCoin uses XBTUSDTM, so USDTM must be tried before USDT.
-_QUOTES = ("USDTM", "USDCM", "USDM", "USDT", "USDC", "USD")
+# USD1 is a stablecoin quote (Aster, MEXC), not a numbered contract: without it
+# ETHUSD1 keeps the whole string as its base and never pairs with ETH anywhere.
+# It sits before USD so that USD1USD still yields USD1 rather than USD1USD.
+_QUOTES = ("USDTM", "USDCM", "USDM", "USDT", "USDC", "USD1", "USD")
 _KIND_SUFFIX = ("PERPETUAL", "PERP", "SWAP")
 # Only real contract multipliers, never a bare \d+: L3, G3, M87 and X2Y2 are
 # ticker names, and a greedy \d+$ turns them into L, G, M and X2Y.
@@ -560,17 +563,17 @@ def mexc_perp() -> list[Observation]:
     except (VenueError, KeyError):
         pass
     # _USDC was excluded by the old _USDT-only filter — 78 linear contracts,
-    # including USDC-margined BTC and ETH, missing from the archive. Two quotes
-    # stay out deliberately: _USD is inverse (coin-margined, turnover in coin,
-    # not comparable), and _USD1 normalises to a broken base — BTC_USD1 becomes
-    # "BTCUSD1", which would match nothing and silently drop out of every
-    # cross-venue comparison, the exact failure mode fixed for OKX above.
+    # including USDC-margined BTC and ETH, missing from the archive. _USD1 came
+    # in once USD1 was recognised as a quote currency; before that BTC_USD1
+    # normalised to "BTCUSD1" and would have matched nothing. Only _USD stays
+    # out: it is inverse, so its turnover is denominated in the coin.
     return [Observation("mexc", PERP, r["symbol"], base_asset(r["symbol"]),
                         mark=_f(r.get("lastPrice")), index=_f(r.get("indexPrice")),
                         funding_rate=_f(r.get("fundingRate")),
                         funding_interval_h=cycles.get(r["symbol"], 8.0),
                         turnover_musd=_f(r.get("amount24")) / 1e6)
-            for r in rows if str(r.get("symbol", "")).endswith(("_USDT", "_USDC"))]
+            for r in rows
+            if str(r.get("symbol", "")).endswith(("_USDT", "_USDC", "_USD1"))]
 
 
 def mexc_spot() -> list[Observation]:
@@ -823,6 +826,98 @@ def backpack_perp() -> list[Observation]:
             for m in marks]
 
 
+def aster_perp() -> list[Observation]:
+    """Binance-compatible API, and the widest dispersion of the venues added
+    after the first pass: 13 contracts past 100% APR at the time of writing.
+    fundingInfo gives the interval per instrument, so nothing is assumed."""
+    prem = _get("https://fapi.asterdex.com/fapi/v1/premiumIndex")
+    intervals: dict[str, float] = {}
+    try:
+        for row in _get("https://fapi.asterdex.com/fapi/v1/fundingInfo"):
+            intervals[row["symbol"]] = _f(row.get("fundingIntervalHours"), 8.0) or 8.0
+    except (VenueError, KeyError):
+        pass
+    vols: dict[str, float] = {}
+    try:
+        for t in _get("https://fapi.asterdex.com/fapi/v1/ticker/24hr"):
+            vols[t.get("symbol")] = _f(t.get("quoteVolume"))
+    except (VenueError, KeyError):
+        pass
+    return [Observation("aster", PERP, p["symbol"], base_asset(p["symbol"]),
+                        mark=_f(p.get("markPrice")), index=_f(p.get("indexPrice")),
+                        funding_rate=_f(p.get("lastFundingRate")),
+                        funding_interval_h=intervals.get(p["symbol"], 8.0),
+                        next_funding=_ms_to_iso(p.get("nextFundingTime")),
+                        turnover_musd=vols.get(p["symbol"], 0.0) / 1e6)
+            for p in prem if p.get("symbol")]
+
+
+def phemex_perp() -> list[Observation]:
+    # Phemex suffixes every numeric field with its representation: Rr is a
+    # ratio, Rp a price, Rv a value. They are already real numbers in v3 — the
+    # scaled-integer fields are the un-suffixed ones in v1, which is the trap.
+    rows = _get("https://api.phemex.com/md/v3/ticker/24hr/all")["result"]
+    out = []
+    for r in rows:
+        sym = str(r.get("symbol", ""))
+        if not sym.endswith(("USDT", "USDC")):
+            continue          # the rest are inverse, settled in the coin
+        mark = _f(r.get("markRp"))
+        out.append(Observation(
+            "phemex", PERP, sym, base_asset(sym),
+            mark=mark, index=_f(r.get("indexRp")),
+            funding_rate=_f(r.get("fundingRateRr")), funding_interval_h=8.0,
+            turnover_musd=_f(r.get("turnoverRv")) / 1e6,
+            oi_musd=_f(r.get("openInterestRv")) * mark / 1e6))
+    return out
+
+
+def kraken_perp() -> list[Observation]:
+    """Kraken quotes funding in PRICE units per hour, not as a ratio.
+
+    fundingRate -6.94e-07 against an index of 0.006121 is -0.011% per hour, not
+    -0.00007%; taking it as a ratio understates the venue by three orders of
+    magnitude. Notable for having nothing at the 10.95% interest-rate floor —
+    its formula is continuous, so every quote here carries information.
+    """
+    rows = _get("https://futures.kraken.com/derivatives/api/v3/tickers")["tickers"]
+    out = []
+    for r in rows:
+        sym = str(r.get("symbol", ""))
+        # PF_ is linear and collateralised in the quote; PI_ is inverse.
+        if r.get("tag") != "perpetual" or not sym.upper().startswith("PF_"):
+            continue
+        index = _f(r.get("indexPrice"))
+        if index <= 0:
+            continue
+        out.append(Observation(
+            "kraken", PERP, sym, base_asset(sym[3:]),
+            mark=_f(r.get("markPrice")), index=index,
+            funding_rate=_f(r.get("fundingRate")) / index, funding_interval_h=1.0,
+            turnover_musd=_f(r.get("volumeQuote")) / 1e6,
+            oi_musd=_f(r.get("openInterest")) * _f(r.get("markPrice")) / 1e6))
+    return out
+
+
+def extended_perp() -> list[Observation]:
+    # hourlyFundingRateCap in the trading config is what fixes the interval at
+    # 1h; the rate itself is published per hour with no interval field.
+    rows = _get("https://api.starknet.extended.exchange/api/v1/info/markets")["data"]
+    out = []
+    for m in rows:
+        if m.get("status") != "ACTIVE":
+            continue
+        st = m.get("marketStats") or {}
+        mark = _f(st.get("markPrice"))
+        out.append(Observation(
+            "extended", PERP, m["name"], base_asset(m["name"]),
+            mark=mark, index=_f(st.get("indexPrice")),
+            funding_rate=_f(st.get("fundingRate")), funding_interval_h=1.0,
+            turnover_musd=_f(st.get("dailyVolume")) / 1e6,
+            oi_musd=_f(st.get("openInterest")) * mark / 1e6))
+    return out
+
+
 def deribit_all() -> list[Observation]:
     """Deribit is the deepest venue for dated crypto futures — the calendar-basis
     reference. The same call returns its perps, so both are captured."""
@@ -879,11 +974,15 @@ ADAPTERS: dict[str, dict[str, object]] = {
     "coinex": {PERP: coinex_perp},
     "bitmex": {PERP: bitmex_perp},
     "bingx": {PERP: bingx_perp},
+    "phemex": {PERP: phemex_perp},
+    "kraken": {PERP: kraken_perp},
     # on-chain perps — widest dispersion, hourly funding on some
     "hyperliquid": {PERP: hyperliquid_perp},
     "dydx": {PERP: dydx_perp},
     "paradex": {PERP: paradex_perp},
     "backpack": {PERP: backpack_perp},
+    "aster": {PERP: aster_perp},
+    "extended": {PERP: extended_perp},
     # dated futures reference — registered under both kinds because one call
     # returns both, and registering only FUTURE meant `--kinds perp` silently
     # collected nothing from Deribit at all

@@ -119,6 +119,31 @@ class TestQuoteVariants(unittest.TestCase):
         """USDCUSDT is the USDC perp quoted in USDT — base USDC, not empty."""
         self.assertEqual(base_asset("USDCUSDT"), "USDC")
 
+    def test_usd1_is_a_quote_currency(self):
+        """USD1 is a stablecoin quote on Aster and MEXC, not a numbered
+        contract. Without it in _QUOTES, ETHUSD1 keeps the whole string and
+        never pairs with ETH on any other venue."""
+        for raw, want in [("ETHUSD1", "ETH"), ("SOLUSD1", "SOL"),
+                          ("XAGUSD1", "XAG"), ("BTC_USD1", "BTC"),
+                          ("USDCUSD1", "USDC"), ("USDTUSD1", "USDT")]:
+            with self.subTest(raw=raw):
+                self.assertEqual(base_asset(raw), want)
+
+    def test_usd1_ordering_against_usd(self):
+        """USD1USD is USD1 quoted in USD, so USD is what comes off. Reversing
+        the order in _QUOTES would leave the whole string."""
+        self.assertEqual(base_asset("USD1USD"), "USD1")
+        self.assertEqual(base_asset("USD1"), "USD1")
+
+    def test_kraken_and_extended_shapes(self):
+        """Kraken prefixes linear perps PF_ (stripped by the adapter, not here);
+        Extended names them ASSET-USD."""
+        for raw, want in [("XBTUSD", "BTC"), ("ETHUSD", "ETH"),
+                          ("BTC-USD", "BTC"), ("HYPE-USD", "HYPE"),
+                          ("USDJPY-USD", "USDJPY")]:
+            with self.subTest(raw=raw):
+                self.assertEqual(base_asset(raw), want)
+
 
 class TestMultipliers(unittest.TestCase):
     """1000PEPE and PEPE are the same asset; their funding rates are directly
