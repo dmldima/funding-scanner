@@ -383,6 +383,7 @@ def _okx_marks(inst_type: str) -> dict[str, float]:
 def okx_perp() -> list[Observation]:
     tick = _okx_tickers("SWAP")
     marks = _okx_marks("SWAP")
+    indices = _okx_indices()
     insts = _get("https://www.okx.com/api/v5/public/instruments",
                  {"instType": "SWAP"})["data"]
     # Funding is per-instrument on OKX, so only the liquid head is queried.
@@ -414,6 +415,7 @@ def okx_perp() -> list[Observation]:
         out.append(Observation(
             "okx", PERP, inst, base_asset(inst),
             mark=marks.get(inst) or _f(t.get("last")),
+            index=indices.get(i.get("uly", ""), 0.0),
             funding_rate=_f(d.get("fundingRate")), funding_interval_h=interval,
             next_funding=_ms_to_iso(d.get("nextFundingTime")),
             turnover_musd=_f(t.get("volCcy24h")) * _f(t.get("last")) / 1e6))
@@ -426,21 +428,38 @@ def okx_perp() -> list[Observation]:
     return out
 
 
+def _okx_indices() -> dict[str, float]:
+    """instId of the underlying index -> price, e.g. BTC-USD -> 65104.
+
+    Every instrument names its own index in `uly`, so this maps straight on.
+    Fetched because `index` must mean the index price in every row of the
+    archive: filling it with `last` for one venue makes the column mean two
+    different things and no later reader can tell which.
+    """
+    out: dict[str, float] = {}
+    for quote in ("USD", "USDT"):
+        try:
+            for x in _get("https://www.okx.com/api/v5/market/index-tickers",
+                          {"quoteCcy": quote})["data"]:
+                out[x["instId"]] = _f(x.get("idxPx"))
+        except (VenueError, KeyError):
+            continue
+    return out
+
+
 def okx_future() -> list[Observation]:
     tick = _okx_tickers("FUTURES")
     marks = _okx_marks("FUTURES")
+    indices = _okx_indices()
     out = []
     for i in _get("https://www.okx.com/api/v5/public/instruments",
                   {"instType": "FUTURES"})["data"]:
         inst = i["instId"]
         t = tick.get(inst, {})
-        # index carries `last` deliberately: it is the wrong number for a mark
-        # but a useful record of how stale the book is, and keeping both makes
-        # the divergence measurable from the archive instead of invisible.
         out.append(Observation(
             "okx", FUTURE, inst, base_asset(inst),
             mark=marks.get(inst) or _f(t.get("last")),
-            index=_f(t.get("last")),
+            index=indices.get(i.get("uly", ""), 0.0),
             expiry=_ms_to_iso(i.get("expTime"))[:10],
             turnover_musd=_f(t.get("volCcy24h")) * _f(t.get("last")) / 1e6))
     return out
@@ -468,13 +487,18 @@ def gate_perp() -> list[Observation]:
     out = []
     for c in contracts:
         name = c["name"]
+        # total_size is in contracts; quanto_multiplier converts to base units,
+        # and it differs per symbol exactly as on MEXC and KuCoin.
+        mark = _f(c.get("mark_price"))
+        size = _f(tick.get(name, {}).get("total_size"))
         out.append(Observation(
             "gate", PERP, name, base_asset(name),
-            mark=_f(c.get("mark_price")), index=_f(c.get("index_price")),
+            mark=mark, index=_f(c.get("index_price")),
             funding_rate=_f(c.get("funding_rate")),
             funding_interval_h=_f(c.get("funding_interval"), 28800) / 3600,
             next_funding=_ms_to_iso(_f(c.get("funding_next_apply")) * 1000),
-            turnover_musd=_f(tick.get(name, {}).get("volume_24h_settle")) / 1e6))
+            turnover_musd=_f(tick.get(name, {}).get("volume_24h_settle")) / 1e6,
+            oi_musd=size * _f(c.get("quanto_multiplier"), 1.0) * mark / 1e6))
     return out
 
 
@@ -562,6 +586,16 @@ def mexc_perp() -> list[Observation]:
             cycles[c.get("symbol")] = _f(c.get("collectCycle"), 8.0) or 8.0
     except (VenueError, KeyError):
         pass
+    # holdVol is in CONTRACTS and contractSize varies per symbol (0.0001 on
+    # BTC_USDT). Same trap as KuCoin's multiplier: without it BTC open interest
+    # reads as 57 quadrillion dollars, and since the factor differs by symbol it
+    # cannot be divided back out of the archive later.
+    sizes: dict[str, float] = {}
+    try:
+        for d in _get("https://contract.mexc.com/api/v1/contract/detail")["data"]:
+            sizes[d.get("symbol")] = _f(d.get("contractSize"), 1.0) or 1.0
+    except (VenueError, KeyError):
+        pass
     # _USDC was excluded by the old _USDT-only filter — 78 linear contracts,
     # including USDC-margined BTC and ETH, missing from the archive. _USD1 came
     # in once USD1 was recognised as a quote currency; before that BTC_USD1
@@ -571,7 +605,9 @@ def mexc_perp() -> list[Observation]:
                         mark=_f(r.get("lastPrice")), index=_f(r.get("indexPrice")),
                         funding_rate=_f(r.get("fundingRate")),
                         funding_interval_h=cycles.get(r["symbol"], 8.0),
-                        turnover_musd=_f(r.get("amount24")) / 1e6)
+                        turnover_musd=_f(r.get("amount24")) / 1e6,
+                        oi_musd=_f(r.get("holdVol")) * sizes.get(r["symbol"], 1.0)
+                        * _f(r.get("lastPrice")) / 1e6)
             for r in rows
             if str(r.get("symbol", "")).endswith(("_USDT", "_USDC", "_USD1"))]
 
@@ -689,15 +725,28 @@ def coinex_perp() -> list[Observation]:
         pass
     out = []
     for r in rows:
+        # Inverse markets (BTCUSD, ETHUSD) are excluded for the same reason
+        # they are on KuCoin, Bitget and MEXC: their turnover is denominated in
+        # the coin, and open_interest_volume is already in USD rather than in
+        # the base, so the multiplication below put CoinEx BTC open interest at
+        # $792bn — more than every other venue in the archive combined.
+        if not str(r.get("market", "")).endswith(("USDT", "USDC")):
+            continue
         # CoinEx defaults to 8h but dynamically moves symbols to 2h or 4h; both
         # timestamps are already in this response, so derive rather than assume.
         gap = (_f(r.get("next_funding_time")) - _f(r.get("latest_funding_time"))) / 3_600_000
+        # index_price and open_interest_volume sit in the ticker response this
+        # already fetches for turnover; both were being read past. OI is in the
+        # base asset, so it needs the mark to become a dollar figure.
+        t = tick.get(r["market"], {})
+        mark = _f(r.get("mark_price")) or _f(t.get("mark_price"))
         out.append(Observation(
             "coinex", PERP, r["market"], base_asset(r["market"]),
-            mark=_f(r.get("mark_price")),
+            mark=mark, index=_f(t.get("index_price")),
             funding_rate=_f(r.get("latest_funding_rate")),
             funding_interval_h=gap if 0.5 <= gap <= 24 else 8.0,
-            turnover_musd=_f(tick.get(r["market"], {}).get("value")) / 1e6))
+            turnover_musd=_f(t.get("value")) / 1e6,
+            oi_musd=_f(t.get("open_interest_volume")) * mark / 1e6))
     return out
 
 
@@ -909,12 +958,17 @@ def extended_perp() -> list[Observation]:
             continue
         st = m.get("marketStats") or {}
         mark = _f(st.get("markPrice"))
+        # openInterest and dailyVolume are ALREADY in quote currency here, and
+        # openInterestBase / dailyVolumeBase are the base-unit pair. Multiplying
+        # the quote figure by the mark put BTC open interest at $4.05 TRILLION —
+        # wrong by exactly one mark price, 64,796x, and it outweighed every
+        # other venue in the archive combined.
         out.append(Observation(
             "extended", PERP, m["name"], base_asset(m["name"]),
             mark=mark, index=_f(st.get("indexPrice")),
             funding_rate=_f(st.get("fundingRate")), funding_interval_h=1.0,
             turnover_musd=_f(st.get("dailyVolume")) / 1e6,
-            oi_musd=_f(st.get("openInterest")) * mark / 1e6))
+            oi_musd=_f(st.get("openInterest")) / 1e6))
     return out
 
 
