@@ -289,8 +289,11 @@ def section_persistence(snaps: dict[str, list[Row]], threshold: float) -> None:
                 peak = max(peak, abs(apr))
             prev_ts = ts
         if start is not None:
+            # Still hot when the archive ends: censored too, not observed to
+            # finish. Marking it False claimed a completed episode and pulled
+            # the "how long do they last" estimate down.
             runs.append((max(hours_between(start, points[-1][0]), gap),
-                         venue, symbol, peak, False))
+                         venue, symbol, peak, True))
 
     print("\n" + "=" * 78)
     print(f"1. PERSISTENCE — how long |funding APR| stays above {threshold:.0f}%")
@@ -299,26 +302,51 @@ def section_persistence(snaps: dict[str, list[Row]], threshold: float) -> None:
         print(f"  no pair exceeded {threshold:.0f}% APR in the whole archive")
         return
 
+    # Episodes that ended at a data gap, or were still running when the archive
+    # ended, are RIGHT-CENSORED: the rate had not fallen, the observation
+    # stopped. Pooling them with completed episodes measures the scanner's
+    # uptime rather than the market — and censoring is not a rare edge here, it
+    # is most of the sample. One instrument stayed above the threshold in all
+    # 132 consecutive snapshots, 85.5h, and was reported as a 10.4h episode
+    # because a scheduler hiccup chopped the run.
+    complete = sorted(r[0] for r in runs if not r[4])
+    censored = sorted(r[0] for r in runs if r[4])
     durations = sorted(r[0] for r in runs)
-    broken = sum(1 for r in runs if r[4])
-    print(f"  episodes       {len(runs)}   (scan interval {gap * 60:.0f} min)")
-    print(f"  median         {statistics.median(durations):.1f}h")
-    print(f"  75th pct       {percentile(durations, 0.75):.1f}h")
-    print(f"  longest        {durations[-1]:.1f}h")
-    print(f"  under 4h       {sum(1 for d in durations if d < 4) / len(durations):.0%} "
-          f"of episodes")
-    if broken:
-        print(f"  gap-truncated  {broken} episodes ended at a data gap, not a "
-              f"rate change — those durations are lower bounds")
 
-    print("\n  Longest episodes:")
-    for hours, venue, symbol, peak, was_broken in sorted(runs, reverse=True)[:8]:
-        flag = "  (gap)" if was_broken else ""
-        print(f"    {venue:<12}{symbol:<18}{hours:>7.1f}h   peak {peak:>8.1f}% APR{flag}")
+    print(f"  episodes       {len(runs):,}   (scan interval {gap * 60:.0f} min)")
+    print(f"  observed to end{len(complete):>7,}   ({len(complete) / len(runs):.0%})   "
+          f"— the rate fell; these are real durations")
+    print(f"  censored       {len(censored):,}   ({len(censored) / len(runs):.0%})   "
+          f"— ended at a data gap or at the archive's edge; LOWER BOUNDS")
+
+    if complete:
+        print(f"\n  Of the {len(complete):,} that were observed to end:")
+        print(f"    median       {statistics.median(complete):.1f}h")
+        print(f"    75th pct     {percentile(complete, 0.75):.1f}h")
+        print(f"    longest      {complete[-1]:.1f}h")
+        print(f"    under 4h     {sum(1 for d in complete if d < 4) / len(complete):.0%}")
+    if censored:
+        print(f"\n  The {len(censored):,} censored ran at least "
+              f"{statistics.median(censored):.1f}h (median) and up to "
+              f"{censored[-1]:.1f}h before observation stopped.")
+        if len(censored) > len(complete):
+            print("    More than half the sample is censored, so even the "
+                  "completed-episode\n    median is biased short — long "
+                  "episodes are the ones a gap is likely to\n    interrupt. "
+                  "Regular sampling is what fixes this, not more data.")
+
+    print("\n  Longest COMPLETED episodes (censored excluded — they are not "
+          "comparable):")
+    done = [r for r in runs if not r[4]]
+    if not done:
+        print("    none: every episode in the archive is censored")
+    for hours, venue, symbol, peak, _ in sorted(
+            done, key=lambda r: -r[0])[:8]:
+        print(f"    {venue:<12}{symbol:<20}{hours:>7.1f}h   peak {peak:>8.1f}% APR")
 
     # Hours of funding needed to pay one spot+perp round trip. Both terms are
     # in percent, so the APR is divided by hours-per-year and nothing else.
-    median_h = statistics.median(durations)
+    median_h = statistics.median(complete) if complete else statistics.median(durations)
     print(f"\n  Break-even hold vs the median episode ({median_h:.1f}h), "
           f"at a {ROUND_TRIP_PCT:.2f}% round trip:")
     for apr in (10, 25, 50, 100, 250):
@@ -460,12 +488,19 @@ def section_cross(snaps: dict[str, list[Row]], capital: float, top: int,
     if not spreads:
         print("  nothing survives both filters — loosen --min-leg-turnover")
         return
-    print(f"{'ASSET':<10}{'LONG @':<13}{'APR':>8}{'SHORT @':<13}{'APR':>8}"
-          f"{'GROSS':>8}{'NET':>8}{'$/YR':>9}")
+    # Open interest was collected on every venue that publishes it and read by
+    # nothing. It is the only depth signal available without an order book:
+    # turnover says a contract traded, OI says someone is still positioned, and
+    # a spread whose thinner leg holds almost no OI cannot be entered at size
+    # however much it churned in the last 24h.
+    print(f"{'ASSET':<9}{'LONG @':<12}{'APR':>8}{'SHORT @':<12}{'APR':>8}"
+          f"{'GROSS':>7}{'NET':>7}{'MIN OI':>9}{'$/YR':>8}")
     print("-" * 78)
     for net, base, lo, hi, gross, _fees, _n in spreads[:top]:
-        print(f"{base:<10}{lo.venue:<13}{lo.apr:>7.1f}%{hi.venue:<13}{hi.apr:>7.1f}%"
-              f"{gross:>7.1f}%{net:>7.1f}%{capital * net / 100:>8,.0f}")
+        oi = min(lo.oi_musd, hi.oi_musd)
+        oi_s = f"{oi:>8,.0f}M" if oi > 0 else "       ?"
+        print(f"{base[:8]:<9}{lo.venue:<12}{lo.apr:>7.1f}%{hi.venue:<12}{hi.apr:>7.1f}%"
+              f"{gross:>6.1f}%{net:>6.1f}%{oi_s}{capital * net / 100:>8,.0f}")
 
     contributions: dict[str, int] = defaultdict(int)
     for _net, _b, lo, hi, _g, _f2, _n in spreads[:40]:
@@ -497,7 +532,7 @@ def section_basis(snaps: dict[str, list[Row]], top: int,
         any_spot.setdefault(base, px)
 
     rows = []
-    thin = 0
+    thin = out_of_range = 0
     for r in latest:
         if r.kind != FUTURE or r.mark <= 0 or not r.expiry:
             continue
@@ -516,7 +551,12 @@ def section_basis(snaps: dict[str, list[Row]], top: int,
                     - datetime.fromisoformat(ts[:10]).date()).days
         except ValueError:
             continue
-        if days <= 0:
+        # Under a week the annualisation multiplier exceeds 50x, so a 0.01%
+        # basis and one round trip of fees become +3% and -88%. Over two years
+        # it is an OKX _XPERP: a perpetual wearing a nominal 2031 expiry, whose
+        # "hold to settlement" is not a calendar trade at all.
+        if not 7 <= days <= 730:
+            out_of_range += 1
             continue
         basis = (r.mark - px) / px * 100
         rows.append((basis * 365 / days, r, days, basis))
@@ -525,17 +565,18 @@ def section_basis(snaps: dict[str, list[Row]], top: int,
     print("\n" + "=" * 78)
     print("4. CALENDAR BASIS (latest) — long spot + short dated future, held to expiry")
     print("=" * 78)
-    print(f"  futures below ${min_turnover:g}M turnover excluded: {thin}")
+    print(f"  excluded: {thin} below ${min_turnover:g}M turnover, "
+          f"{out_of_range} outside 7-730 days to expiry")
     if not rows:
         print("  no dated futures with a usable spot reference in this archive")
         return
-    print(f"{'VENUE':<11}{'SYMBOL':<22}{'EXPIRY':<12}{'DAYS':>6}{'BASIS':>8}"
-          f"{'ANN':>8}{'NET**':>8}")
+    print(f"{'VENUE':<10}{'SYMBOL':<26}{'EXPIRY':<12}{'DAYS':>5}{'BASIS':>7}"
+          f"{'ANN':>7}{'NET**':>8}")
     print("-" * 78)
     for ann, r, days, basis in rows[:top]:
         net = (basis - (SPOT_FEE_PCT * 2 + fee(r.venue))) * 365 / days
-        print(f"{r.venue:<11}{r.symbol:<22}{r.expiry:<12}{days:>6}"
-              f"{basis:>7.2f}%{ann:>7.2f}%{net:>7.2f}%")
+        print(f"{r.venue:<10}{r.symbol[:25]:<26}{r.expiry:<12}{days:>5}"
+              f"{basis:>6.2f}%{ann:>6.2f}%{net:>7.2f}%")
     print(f"  ** held to settlement, so the future costs no closing fee. "
           f"Risk-free is {RISK_FREE_PCT}%.")
 

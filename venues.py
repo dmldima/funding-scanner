@@ -384,6 +384,15 @@ def okx_perp() -> list[Observation]:
     tick = _okx_tickers("SWAP")
     marks = _okx_marks("SWAP")
     indices = _okx_indices()
+    # oiUsd is already denominated in dollars, so no multiplier is involved and
+    # none can be got wrong — unlike oi/oiCcy, which are contracts and coin.
+    oi: dict[str, float] = {}
+    try:
+        for x in _get("https://www.okx.com/api/v5/public/open-interest",
+                      {"instType": "SWAP"})["data"]:
+            oi[x["instId"]] = _f(x.get("oiUsd"))
+    except (VenueError, KeyError):
+        pass
     insts = _get("https://www.okx.com/api/v5/public/instruments",
                  {"instType": "SWAP"})["data"]
     # Funding is per-instrument on OKX, so only the liquid head is queried.
@@ -418,7 +427,8 @@ def okx_perp() -> list[Observation]:
             index=indices.get(i.get("uly", ""), 0.0),
             funding_rate=_f(d.get("fundingRate")), funding_interval_h=interval,
             next_funding=_ms_to_iso(d.get("nextFundingTime")),
-            turnover_musd=_f(t.get("volCcy24h")) * _f(t.get("last")) / 1e6))
+            turnover_musd=_f(t.get("volCcy24h")) * _f(t.get("last")) / 1e6,
+            oi_musd=oi.get(inst, 0.0) / 1e6))
         time.sleep(0.04)
     if skipped:
         # Partial data beats no data, so this does not raise — but a silent skip
