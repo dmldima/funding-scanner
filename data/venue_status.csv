@@ -59609,3 +59609,37 @@ ts,source,ok,detail
 2026-08-23T05:49:46+00:00,whitebit:perp,1,ok 398 (0.3s)
 2026-08-23T05:49:46+00:00,whitebit:spot,1,ok 478 (0.3s)
 2026-08-23T05:49:46+00:00,okx:perp,1,CAPPED 150 of 438 linear swaps by turnover
+2026-08-23T05:57:59+00:00,aster:perp,1,ok 707 (1.7s)
+2026-08-23T05:57:59+00:00,backpack:perp,1,ok 78 (0.5s)
+2026-08-23T05:57:59+00:00,binance:future,0,FAIL HTTP 451 geo-blocked: https://fapi.binance.com/fapi/v1/premiumIndex
+2026-08-23T05:57:59+00:00,binance:perp,0,FAIL HTTP 451 geo-blocked: https://fapi.binance.com/fapi/v1/premiumIndex
+2026-08-23T05:57:59+00:00,binance:spot,0,FAIL HTTP 451 geo-blocked: https://api.binance.com/api/v3/ticker/24hr
+2026-08-23T05:57:59+00:00,bingx:perp,1,ok 866 (2.7s)
+2026-08-23T05:57:59+00:00,bitget:perp,1,ok 808 (1.2s)
+2026-08-23T05:57:59+00:00,bitget:spot,1,ok 1277 (0.6s)
+2026-08-23T05:57:59+00:00,bitmex:perp,1,ok 15 (0.3s)
+2026-08-23T05:57:59+00:00,bybit:future,0,FAIL HTTP 403: https://api.bybit.com/v5/market/tickers?category=linear
+2026-08-23T05:57:59+00:00,bybit:perp,0,FAIL HTTP 403: https://api.bybit.com/v5/market/tickers?category=linear
+2026-08-23T05:57:59+00:00,bybit:spot,0,FAIL HTTP 403: https://api.bybit.com/v5/market/tickers?category=spot
+2026-08-23T05:57:59+00:00,coinex:perp,1,ok 223 (0.6s)
+2026-08-23T05:57:59+00:00,deribit:future+perp,1,ok 26 (0.7s)
+2026-08-23T05:57:59+00:00,dydx:perp,1,ok 99 (0.7s)
+2026-08-23T05:57:59+00:00,extended:perp,1,ok 289 (2.0s)
+2026-08-23T05:57:59+00:00,gate:future,1,ok 30 (1.6s)
+2026-08-23T05:57:59+00:00,gate:perp,1,ok 935 (3.7s)
+2026-08-23T05:57:59+00:00,gate:spot,1,ok 2148 (1.8s)
+2026-08-23T05:57:59+00:00,htx:perp,1,ok 295 (1.0s)
+2026-08-23T05:57:59+00:00,hyperliquid:perp,1,ok 177 (0.3s)
+2026-08-23T05:57:59+00:00,kraken:perp,1,ok 277 (0.1s)
+2026-08-23T05:57:59+00:00,kucoin:perp,1,ok 669 (0.4s)
+2026-08-23T05:57:59+00:00,kucoin:spot,1,ok 902 (0.3s)
+2026-08-23T05:57:59+00:00,mexc:perp,1,ok 1140 (1.0s)
+2026-08-23T05:57:59+00:00,mexc:spot,1,ok 1701 (0.4s)
+2026-08-23T05:57:59+00:00,okx:future,1,ok 174 (1.2s)
+2026-08-23T05:57:59+00:00,okx:perp,1,ok 150 (39.9s)
+2026-08-23T05:57:59+00:00,okx:spot,1,ok 1379 (0.4s)
+2026-08-23T05:57:59+00:00,paradex:perp,1,ok 62 (1.7s)
+2026-08-23T05:57:59+00:00,phemex:perp,1,ok 258 (0.6s)
+2026-08-23T05:57:59+00:00,whitebit:perp,1,ok 398 (0.6s)
+2026-08-23T05:57:59+00:00,whitebit:spot,1,ok 478 (0.2s)
+2026-08-23T05:57:59+00:00,okx:perp,1,CAPPED 150 of 438 linear swaps by turnover
