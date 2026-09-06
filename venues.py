@@ -18,9 +18,11 @@ Every adapter is isolated: one venue failing never stops a scan.
 
 from __future__ import annotations
 
+import http.client
 import json
 import random
 import re
+import ssl
 import sys
 import time
 import urllib.error
@@ -78,7 +80,17 @@ def _request(url: str, *, body: dict | None = None) -> object:
             if exc.code not in (429, 500, 502, 503, 504):
                 raise VenueError(f"HTTP {exc.code}: {url}") from exc
             last = exc
-        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+        # Everything here is a transport-layer failure that a retry can fix.
+        # http.client.HTTPException is the one that is easy to miss: it does
+        # NOT descend from URLError, so an IncompleteRead — a body truncated
+        # mid-transfer, which MEXC has done in production on a 541 KB perp
+        # response — escaped this handler unretried and cost the whole
+        # snapshot. ssl.SSLError and ConnectionError are the same class of
+        # mid-read break: urlopen only wraps failures raised while connecting,
+        # so a socket that dies during resp.read() surfaces raw.
+        except (urllib.error.URLError, TimeoutError, ConnectionError,
+                http.client.HTTPException, ssl.SSLError,
+                json.JSONDecodeError) as exc:
             last = exc
         time.sleep(0.8 * 2 ** attempt + random.uniform(0, 0.3))
     raise VenueError(f"failed after 3 attempts: {url}: {last}")
