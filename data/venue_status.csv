@@ -116219,3 +116219,37 @@ ts,source,ok,detail
 2026-10-30T18:48:22+00:00,whitebit:perp,1,ok 395 (0.4s)
 2026-10-30T18:48:22+00:00,whitebit:spot,1,ok 471 (0.3s)
 2026-10-30T18:48:22+00:00,okx:perp,1,CAPPED 150 of 517 linear swaps by turnover
+2026-10-30T20:29:13+00:00,aster:perp,1,ok 799 (0.7s)
+2026-10-30T20:29:13+00:00,backpack:perp,1,ok 92 (0.4s)
+2026-10-30T20:29:13+00:00,binance:future,0,FAIL HTTP 451 geo-blocked: https://fapi.binance.com/fapi/v1/premiumIndex
+2026-10-30T20:29:13+00:00,binance:perp,0,FAIL HTTP 451 geo-blocked: https://fapi.binance.com/fapi/v1/premiumIndex
+2026-10-30T20:29:13+00:00,binance:spot,0,FAIL HTTP 451 geo-blocked: https://api.binance.com/api/v3/ticker/24hr
+2026-10-30T20:29:13+00:00,bingx:perp,1,ok 1067 (2.3s)
+2026-10-30T20:29:13+00:00,bitget:perp,1,ok 917 (1.0s)
+2026-10-30T20:29:13+00:00,bitget:spot,1,ok 3591 (0.3s)
+2026-10-30T20:29:13+00:00,bitmex:perp,0,FAIL HTTP 403: https://www.bitmex.com/api/v1/instrument/active
+2026-10-30T20:29:13+00:00,bybit:future,0,FAIL HTTP 403: https://api.bybit.com/v5/market/tickers?category=linear
+2026-10-30T20:29:13+00:00,bybit:perp,0,FAIL HTTP 403: https://api.bybit.com/v5/market/tickers?category=linear
+2026-10-30T20:29:13+00:00,bybit:spot,0,FAIL HTTP 403: https://api.bybit.com/v5/market/tickers?category=spot
+2026-10-30T20:29:13+00:00,coinex:perp,0,FAIL failed after 3 attempts: https://api.coinex.com/v2/futures/funding-rate: HTTP Error 503: Service Temporar
+2026-10-30T20:29:13+00:00,deribit:future+perp,1,ok 28 (0.6s)
+2026-10-30T20:29:13+00:00,dydx:perp,1,ok 57 (0.5s)
+2026-10-30T20:29:13+00:00,extended:perp,1,ok 341 (1.8s)
+2026-10-30T20:29:13+00:00,gate:future,1,ok 30 (1.4s)
+2026-10-30T20:29:13+00:00,gate:perp,1,ok 1070 (2.9s)
+2026-10-30T20:29:13+00:00,gate:spot,1,ok 2104 (1.6s)
+2026-10-30T20:29:13+00:00,htx:perp,1,ok 403 (3.3s)
+2026-10-30T20:29:13+00:00,hyperliquid:perp,1,ok 179 (0.2s)
+2026-10-30T20:29:13+00:00,kraken:perp,1,ok 209 (0.5s)
+2026-10-30T20:29:13+00:00,kucoin:perp,1,ok 712 (0.4s)
+2026-10-30T20:29:13+00:00,kucoin:spot,1,ok 875 (0.3s)
+2026-10-30T20:29:13+00:00,mexc:perp,1,ok 1189 (2.4s)
+2026-10-30T20:29:13+00:00,mexc:spot,1,ok 1446 (0.2s)
+2026-10-30T20:29:13+00:00,okx:future,1,ok 285 (1.1s)
+2026-10-30T20:29:13+00:00,okx:perp,1,ok 150 (37.6s)
+2026-10-30T20:29:13+00:00,okx:spot,1,ok 1212 (0.4s)
+2026-10-30T20:29:13+00:00,paradex:perp,1,ok 66 (1.5s)
+2026-10-30T20:29:13+00:00,phemex:perp,1,ok 140 (0.8s)
+2026-10-30T20:29:13+00:00,whitebit:perp,1,ok 395 (0.6s)
+2026-10-30T20:29:13+00:00,whitebit:spot,1,ok 471 (0.5s)
+2026-10-30T20:29:13+00:00,okx:perp,1,CAPPED 150 of 517 linear swaps by turnover
